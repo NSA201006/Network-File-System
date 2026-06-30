@@ -62,7 +62,13 @@ typedef enum {
 
     /* ── Feature 4: VIEW ── */
     CMD_VIEW                 = 16,   /* Client  → NM  */
-    CMD_VIEW_RESP            = 17    /* NM      → Client */
+    CMD_VIEW_RESP            = 17,   /* NM      → Client */
+
+    /* ── DELETE ── */
+    CMD_DELETE               = 18,   /* Client  → NM  */
+    CMD_DELETE_RESP          = 19,   /* NM      → Client */
+    CMD_SS_DELETE            = 20,   /* NM      → SS  */
+    CMD_SS_DELETE_ACK        = 21    /* SS      → NM  */
 } CommandType;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -179,5 +185,39 @@ typedef struct {
     int32_t status;
     int32_t file_count;
 } ViewResponseHeader;
+
+/* ── DIRECT STREAMING CHUNKS ────────────────────────────────────────────── */
+
+typedef struct {
+    int32_t chunk_size;                        /* Number of bytes in data; 0 means STOP packet */
+    char    data[256];
+} FileChunkPacket;
+
+/* ── DELETE ─────────────────────────────────────────────────────────────── */
+
+/* Client → NM: request file deletion */
+typedef struct {
+    int32_t command_type;                      /* CMD_DELETE */
+    char    username[MAX_USERNAME];
+    char    filename[MAX_FILENAME];
+} DeleteRequestPacket;
+
+/* NM → Client: response to delete request */
+typedef struct {
+    int32_t status;                            /* ERR_OK or error code */
+    char    message[MAX_MESSAGE];
+} DeleteResponsePacket;
+
+/* NM → SS: delete the physical file */
+typedef struct {
+    int32_t command_type;                      /* CMD_SS_DELETE */
+    char    filename[MAX_FILENAME];
+} SSDeletePacket;
+
+/* SS → NM: ack for CMD_SS_DELETE */
+typedef struct {
+    int32_t status;                            /* ERR_OK or error code */
+    char    message[MAX_MESSAGE];
+} SSDeleteAck;
 
 #endif /* PROTOCOLS_H */

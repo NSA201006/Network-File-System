@@ -55,7 +55,7 @@ static void print_banner(const char *username) {
     printf(CLR_CYAN "║  " CLR_BOLD CLR_WHITE "Docs++  Distributed File System Client" CLR_RESET CLR_CYAN "    ║\n" CLR_RESET);
     printf(CLR_CYAN "╚══════════════════════════════════════════════╝\n" CLR_RESET);
     printf(CLR_DIM  "  Logged in as: " CLR_RESET CLR_GREEN CLR_BOLD "%s" CLR_RESET "\n\n", username);
-    printf(CLR_DIM  "  Commands:  CREATE <file>  VIEW [-a|-l|-al]  READ <file>  help  exit\n" CLR_RESET);
+    printf(CLR_DIM  "  Commands:  CREATE <file>  VIEW [-a|-l|-al]  READ <file>  STREAM <file>  DELETE <file>  help  exit\n" CLR_RESET);
     printf("\n");
 }
 
@@ -198,18 +198,167 @@ static void cmd_read(const char *username, const char *filename) {
         return;
     }
 
-    char *buf = malloc((size_t)hdr.content_length + 1);
-    if (!buf) { close(ss_fd); return; }
-    recv_all(ss_fd, buf, (size_t)hdr.content_length);
-    buf[hdr.content_length] = '\0';
-    close(ss_fd);
-
     printf("\n" CLR_CYAN "─── %s ───────────────────────────────────\n" CLR_RESET,
            filename);
-    printf("%s", buf);
-    if (buf[hdr.content_length - 1] != '\n') printf("\n");
+
+    int success = 0;
+    while (1) {
+        FileChunkPacket chunk;
+        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) {
+            break;
+        }
+        if (chunk.chunk_size == 0) {
+            success = 1;
+            break;
+        }
+        fwrite(chunk.data, 1, (size_t)chunk.chunk_size, stdout);
+        fflush(stdout);
+    }
+    close(ss_fd);
+
+    if (!success) {
+        printf("\n");
+        print_err("Storage server went down mid-reading.");
+    } else {
+        printf("\n");
+    }
     printf(CLR_CYAN "─────────────────────────────────────────────────\n" CLR_RESET);
-    free(buf);
+}
+
+static void cmd_stream(const char *username, const char *filename) {
+    if (!filename || filename[0] == '\0') {
+        print_err("Usage: STREAM <filename>");
+        return;
+    }
+
+    char ss_ip[MAX_IP_LEN] = {0};
+    int  ss_port            = 0;
+
+    printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
+
+    if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
+
+    int ss_fd = connect_to_server(ss_ip, ss_port);
+    if (ss_fd < 0) {
+        print_err("Cannot connect to Storage Server.");
+        return;
+    }
+
+    /* Send command type + filename */
+    int32_t cmd = CMD_FILE_READ;
+    char    fname_buf[MAX_FILENAME] = {0};
+    strncpy(fname_buf, filename, MAX_FILENAME - 1);
+
+    send_all(ss_fd, &cmd,      sizeof(cmd));
+    send_all(ss_fd, fname_buf, sizeof(fname_buf));
+
+    /* Receive header */
+    ReadResponseHeader hdr;
+    if (recv_struct(ss_fd, &hdr, sizeof(hdr)) < 0 || hdr.status != ERR_OK) {
+        print_err("File not found on Storage Server.");
+        close(ss_fd);
+        return;
+    }
+
+    /* Receive content */
+    if (hdr.content_length <= 0) {
+        print_info("File is empty.");
+        close(ss_fd);
+        return;
+    }
+
+    printf("\n" CLR_CYAN "─── STREAM: %s ─────────────────────────────\n" CLR_RESET,
+           filename);
+
+    char word_buf[512] = {0};
+    int word_len = 0;
+    int success = 0;
+
+    while (1) {
+        FileChunkPacket chunk;
+        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) {
+            break;
+        }
+        if (chunk.chunk_size == 0) {
+            success = 1;
+            break;
+        }
+
+        for (int i = 0; i < chunk.chunk_size; i++) {
+            char c = chunk.data[i];
+            if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+                if (word_len > 0) {
+                    word_buf[word_len] = '\0';
+                    printf("%s", word_buf);
+                    fflush(stdout);
+                    usleep(100000); // 0.1 seconds
+                    word_len = 0;
+                }
+                putchar(c);
+                fflush(stdout);
+            } else {
+                if (word_len < (int)sizeof(word_buf) - 1) {
+                    word_buf[word_len++] = c;
+                }
+            }
+        }
+    }
+    close(ss_fd);
+
+    if (!success) {
+        printf("\n");
+        print_err("Storage server went down mid-streaming.");
+    } else {
+        if (word_len > 0) {
+            word_buf[word_len] = '\0';
+            printf("%s", word_buf);
+            fflush(stdout);
+        }
+        printf("\n");
+    }
+    printf(CLR_CYAN "─────────────────────────────────────────────────\n" CLR_RESET);
+}
+
+static void cmd_delete(const char *username, const char *filename) {
+    if (!filename || filename[0] == '\0') {
+        print_err("Usage: DELETE <filename>");
+        return;
+    }
+
+    printf(CLR_DIM "  Deleting file '%s'...\n" CLR_RESET, filename);
+
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    DeleteRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_DELETE;
+    strncpy(req.username, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send DELETE request.");
+        close(sockfd);
+        return;
+    }
+
+    DeleteResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+    close(sockfd);
+
+    if (resp.status == ERR_OK) {
+        print_ok(resp.message);
+    } else {
+        print_err(resp.message);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -390,6 +539,8 @@ static void print_help(void) {
     printf("  " CLR_BOLD "VIEW -l" CLR_RESET "            Detailed listing (words, chars, timestamps)\n");
     printf("  " CLR_BOLD "VIEW -al" CLR_RESET "           All files with full details\n");
     printf("  " CLR_BOLD "READ" CLR_RESET " <filename>    Read and display a file's contents\n");
+    printf("  " CLR_BOLD "STREAM" CLR_RESET " <filename>  Stream a file's contents word-by-word with delay\n");
+    printf("  " CLR_BOLD "DELETE" CLR_RESET " <filename>  Delete a file from the NFS (owner only)\n");
     printf("  " CLR_BOLD "exit" CLR_RESET " / " CLR_BOLD "quit" CLR_RESET "       Disconnect\n");
     printf(CLR_CYAN "  ────────────────────────────────────────────────────\n\n" CLR_RESET);
 }
@@ -452,6 +603,20 @@ static void repl(const char *username) {
         if (strncasecmp(cmd, "READ ", 5) == 0) {
             char *fname = trim(cmd + 5);
             cmd_read(username, fname);
+            continue;
+        }
+
+        /* ── STREAM <filename> ── */
+        if (strncasecmp(cmd, "STREAM ", 7) == 0) {
+            char *fname = trim(cmd + 7);
+            cmd_stream(username, fname);
+            continue;
+        }
+
+        /* ── DELETE <filename> ── */
+        if (strncasecmp(cmd, "DELETE ", 7) == 0) {
+            char *fname = trim(cmd + 7);
+            cmd_delete(username, fname);
             continue;
         }
 

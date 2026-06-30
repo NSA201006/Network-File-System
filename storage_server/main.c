@@ -39,6 +39,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <errno.h>
 
 /* ─── Globals set from argv ──────────────────────────────────────────────── */
 static char  g_nm_ip[MAX_IP_LEN]       = "127.0.0.1";
@@ -105,9 +106,34 @@ static void handle_file_read(int fd, const char *filename) {
         .content_length = length
     };
     send_struct(fd, &hdr, sizeof(hdr));
-    if (length > 0) send_all(fd, buffer, (size_t)length);
+
+    if (length > 0) {
+        long sent = 0;
+        while (sent < length) {
+            FileChunkPacket chunk;
+            memset(&chunk, 0, sizeof(chunk));
+            long to_send = length - sent;
+            if (to_send > 256) to_send = 256;
+
+            chunk.chunk_size = (int32_t)to_send;
+            memcpy(chunk.data, buffer + sent, (size_t)to_send);
+
+            if (send_struct(fd, &chunk, sizeof(chunk)) < 0) {
+                ss_log("Error sending chunk for '%s'", filename);
+                break;
+            }
+            sent += to_send;
+        }
+    }
+
+    /* Send STOP packet */
+    FileChunkPacket stop_chunk;
+    memset(&stop_chunk, 0, sizeof(stop_chunk));
+    stop_chunk.chunk_size = 0;
+    send_struct(fd, &stop_chunk, sizeof(stop_chunk));
+
     free(buffer);
-    ss_log("READ '%s' — sent %ld bytes.", filename, length);
+    ss_log("READ '%s' — sent %ld bytes in chunks.", filename, length);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -157,6 +183,59 @@ static void handle_ss_create(int fd, int32_t cmd_type) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  CMD_SS_DELETE handler
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void handle_ss_delete(int fd, int32_t cmd_type) {
+    SSDeletePacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd,
+                    ((char *)&req) + sizeof(int32_t),
+                    sizeof(req)    - sizeof(int32_t)) != 0) {
+        ss_log("Failed to receive SSDeletePacket.");
+        return;
+    }
+
+    ss_log("DELETE request: file='%s'", req.filename);
+
+    SSDeleteAck ack;
+    memset(&ack, 0, sizeof(ack));
+
+    /* Security check */
+    if (contains_path_traversal(req.filename)) {
+        ack.status = ERR_INTERNAL;
+        snprintf(ack.message, sizeof(ack.message),
+                 "ERROR: Invalid filename '%s'.", req.filename);
+        ss_log("DELETE blocked: path traversal in '%s'.", req.filename);
+        send_struct(fd, &ack, sizeof(ack));
+        return;
+    }
+
+    /* Delete physical file */
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+
+    if (remove(path) != 0) {
+        if (errno == ENOENT) {
+            ack.status = ERR_OK; /* already gone */
+            snprintf(ack.message, sizeof(ack.message),
+                     "File '%s' was not on disk (already evicted).", req.filename);
+            ss_log("DELETE: '%s' not on disk, treating as deleted.", req.filename);
+        } else {
+            ack.status = ERR_INTERNAL;
+            snprintf(ack.message, sizeof(ack.message),
+                     "ERROR: Failed to delete '%s' from disk: %s.", req.filename, strerror(errno));
+            ss_log("DELETE failed for '%s': %s", req.filename, strerror(errno));
+        }
+    } else {
+        ack.status = ERR_OK;
+        snprintf(ack.message, sizeof(ack.message),
+                 "File '%s' deleted from SS disk.", req.filename);
+        ss_log("DELETE OK: '%s' physically removed.", req.filename);
+    }
+    send_struct(fd, &ack, sizeof(ack));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Per-connection thread
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
@@ -186,6 +265,9 @@ static void *handle_client_connection(void *arg) {
 
     } else if (cmd_type == CMD_SS_CREATE) {
         handle_ss_create(fd, cmd_type);
+
+    } else if (cmd_type == CMD_SS_DELETE) {
+        handle_ss_delete(fd, cmd_type);
 
     } else {
         ss_log("Unknown command %d — ignored.", cmd_type);

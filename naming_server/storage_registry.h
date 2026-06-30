@@ -119,4 +119,12 @@ void      registry_update_file_stats(const char *filename,
 void      registry_save_metadata(void);
 void      registry_load_metadata(void);
 
+/* Get owner of a file */
+const char *registry_get_file_owner(const char *filename);
+
+/* Delete a file from tracking map and metadata.
+ * Returns 0 on success, -1 if file not found.
+ * Populates out_servers and out_server_count with the Storage Servers holding the file/replicas. */
+int       registry_delete_file(const char *filename, StorageServer *out_servers[], int *out_server_count);
+
 #endif /* STORAGE_REGISTRY_H */

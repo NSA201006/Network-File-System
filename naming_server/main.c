@@ -138,21 +138,34 @@ static void handle_client_lookup(int fd, int32_t cmd_type,
 
     LookupResponsePacket resp;
     memset(&resp, 0, sizeof(resp));
-    StorageServer *ss = registry_find_ss_for_file(packet.filename);
-    if (!ss) {
+
+    if (!registry_file_exists(packet.filename)) {
         resp.status = ERR_FILE_NOT_FOUND;
         snprintf(resp.message, sizeof(resp.message),
-                 "File '%s' not found.", packet.filename);
+                 "ERROR: File '%s' not found.", packet.filename);
         nm_log("Lookup: file '%s' not found.", packet.filename);
-    } else {
-        resp.status  = ERR_OK;
-        resp.ss_port = ss->client_port;
-        strncpy(resp.ss_ip, ss->ip, MAX_IP_LEN - 1);
+    } else if (registry_user_has_access(packet.filename, packet.username) == 0) {
+        resp.status = ERR_NO_PERMISSION;
         snprintf(resp.message, sizeof(resp.message),
-                 "File '%s' is on SS at %s:%d.",
-                 packet.filename, ss->ip, ss->client_port);
-        nm_log("Lookup OK: '%s' → %s:%d", packet.filename,
-               ss->ip, ss->client_port);
+                 "ERROR: Permission denied for file '%s'.", packet.filename);
+        nm_log("Lookup: permission denied for user '%s' on file '%s'.", packet.username, packet.filename);
+    } else {
+        StorageServer *ss = registry_find_ss_for_file(packet.filename);
+        if (!ss) {
+            resp.status = ERR_FILE_UNAVAILABLE;
+            snprintf(resp.message, sizeof(resp.message),
+                     "ERROR: Storage Server hosting '%s' is offline.", packet.filename);
+            nm_log("Lookup: Storage Server hosting '%s' is offline.", packet.filename);
+        } else {
+            resp.status  = ERR_OK;
+            resp.ss_port = ss->client_port;
+            strncpy(resp.ss_ip, ss->ip, MAX_IP_LEN - 1);
+            snprintf(resp.message, sizeof(resp.message),
+                     "File '%s' is on SS at %s:%d.",
+                     packet.filename, ss->ip, ss->client_port);
+            nm_log("Lookup OK: '%s' → %s:%d", packet.filename,
+                   ss->ip, ss->client_port);
+        }
     }
     send_struct(fd, &resp, sizeof(resp));
 }
@@ -336,6 +349,121 @@ static void handle_view(int fd, int32_t cmd_type,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  Handler: CMD_DELETE
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
+    DeleteRequestPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd,
+                    ((char *)&req) + sizeof(int32_t),
+                    sizeof(req)    - sizeof(int32_t)) != 0) {
+        nm_log("Failed to receive DeleteRequestPacket from %s", peer_ip);
+        return;
+    }
+
+    nm_log("DELETE request: file='%s' by user='%s' from %s",
+           req.filename, req.username, peer_ip);
+
+    DeleteResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+
+    /* 1. Check if file exists */
+    if (!registry_file_exists(req.filename)) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: File '%s' does not exist.", req.filename);
+        nm_log("DELETE denied: '%s' does not exist.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    /* 2. Check ownership authorization (only owner can delete) */
+    const char *owner = registry_get_file_owner(req.filename);
+    if (!owner || strcmp(owner, req.username) != 0) {
+        resp.status = ERR_NO_PERMISSION;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: Permission denied. Only the owner '%s' can delete this file.", owner ? owner : "unknown");
+        nm_log("DELETE denied: user '%s' is not owner of '%s' (owner is '%s')",
+               req.username, req.filename, owner ? owner : "unknown");
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    /* 3. Delete from registry tracking map and metadata */
+    StorageServer *servers[MAX_REPLICAS];
+    int server_count = 0;
+    memset(servers, 0, sizeof(servers));
+
+    if (registry_delete_file(req.filename, servers, &server_count) < 0) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: File '%s' not found in registry.", req.filename);
+        nm_log("DELETE failed: '%s' not in registry.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    /* 4. Cascade eviction to all copies (replicas) */
+    int deleted_count = 0;
+    int failed_count = 0;
+
+    for (int i = 0; i < server_count; ++i) {
+        if (!servers[i]) continue;
+
+        if (servers[i]->status != SS_STATUS_ONLINE) {
+            nm_log("DELETE replication: SS[%d] %s:%d is offline. Skipping physical wipe.",
+                   servers[i]->id, servers[i]->ip, servers[i]->client_port);
+            failed_count++;
+            continue;
+        }
+
+        int ss_fd = connect_to_server(servers[i]->ip, servers[i]->client_port);
+        if (ss_fd < 0) {
+            nm_log("DELETE replication: cannot connect to SS[%d] at %s:%d",
+                   servers[i]->id, servers[i]->ip, servers[i]->client_port);
+            failed_count++;
+            continue;
+        }
+
+        SSDeletePacket ss_req;
+        memset(&ss_req, 0, sizeof(ss_req));
+        ss_req.command_type = CMD_SS_DELETE;
+        strncpy(ss_req.filename, req.filename, MAX_FILENAME - 1);
+
+        if (send_struct(ss_fd, &ss_req, sizeof(ss_req)) != 0) {
+            nm_log("DELETE replication: failed to send delete to SS[%d]", servers[i]->id);
+            close(ss_fd);
+            failed_count++;
+            continue;
+        }
+
+        SSDeleteAck ack;
+        memset(&ack, 0, sizeof(ack));
+        if (recv_struct(ss_fd, &ack, sizeof(ack)) != 0 || ack.status != ERR_OK) {
+            nm_log("DELETE replication: failed ACK or error from SS[%d]", servers[i]->id);
+            failed_count++;
+        } else {
+            deleted_count++;
+        }
+        close(ss_fd);
+    }
+
+    nm_log("DELETE OK: '%s' removed from tracking. Physically wiped from %d/%d servers.",
+           req.filename, deleted_count, server_count);
+
+    resp.status = ERR_OK;
+    if (failed_count > 0) {
+        snprintf(resp.message, sizeof(resp.message),
+                 "File '%s' deleted from tracking. Physical copies wiped: %d, failed: %d.",
+                 req.filename, deleted_count, failed_count);
+    } else {
+        snprintf(resp.message, sizeof(resp.message),
+                 "File '%s' deleted successfully.", req.filename);
+    }
+    send_struct(fd, &resp, sizeof(resp));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Main connection dispatcher
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void *handle_connection(void *arg) {
@@ -366,6 +494,9 @@ static void *handle_connection(void *arg) {
             break;
         case CMD_VIEW:
             handle_view(fd, cmd_type, peer_ip);
+            break;
+        case CMD_DELETE:
+            handle_delete(fd, cmd_type, peer_ip);
             break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);

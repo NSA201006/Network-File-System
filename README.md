@@ -79,7 +79,9 @@ mkdir -p ss_storage2 && echo "hello from ss2" > ss_storage2/file2.txt
 | `VIEW -a` | **Feature 4** | List **all** files on the system |
 | `VIEW -l` | **Feature 4** | Detailed listing (words, chars, timestamps) |
 | `VIEW -al` | **Feature 4** | All files with full details |
-| `READ <filename>` | Existing | Read and display a file's contents |
+| `READ <filename>` | **READ** | Direct chunked read & display a file's contents |
+| `STREAM <filename>` | **READ** | Word-by-word content streaming with 0.1s delay |
+| `DELETE <filename>` | **DELETE**| Cascading deletion & NM tracking eviction (owner only) |
 | `help` | — | Show command reference |
 | `exit` | — | Disconnect |
 
@@ -99,6 +101,8 @@ Client ──CREATE──▶ NM ──SS_CREATE──▶ SS (creates empty file 
        ◀───response──
 ```
 
+---
+
 ## Feature 4 — VIEW
 
 ```
@@ -109,6 +113,69 @@ alice@docs++ > VIEW -l
   ─────────────────────────     ───────────────  ───────   ───────  ───────  ─────────────────  ─────────────────
   report.txt                    alice                  0         0         0  2024-11-05 22:31   2024-11-05 22:31
   file1.txt                     unknown                3        14        14  2024-11-05 22:28   2024-11-05 22:28
+```
+
+---
+
+## Feature READ & STREAM (Direct Data Streaming)
+
+- **Lookup & Status Authorization**: The Naming Server enforces user access control permissions and verifies that the Storage Server is actively online before returning its address to the client.
+- **Direct Data Streaming**: The NM is kept out of the data path. The client establishes a direct TCP connection with the Storage Server. The SS streams the file in chunks using `FileChunkPacket` and terminates with a STOP packet (`chunk_size == 0`).
+- **Word-by-word Simulation (`STREAM`)**: Displays contents word-by-word with a delay of 0.1 seconds between each word. Reports a clean error if the Storage Server goes down mid-stream.
+
+### Expected Output (READ)
+```
+alice@docs++ > READ report.txt
+  Looking up 'report.txt'...
+
+─── report.txt ───────────────────────────────────
+Hello from Docs++ NFS. This is a direct data stream test.
+─────────────────────────────────────────────────
+```
+
+### Expected Output (Permission Denied)
+```
+bob@docs++ > READ report.txt
+  Looking up 'report.txt'...
+✗ ERROR: Permission denied for file 'report.txt'.
+```
+
+### Expected Output (SS Offline)
+```
+alice@docs++ > READ report.txt
+  Looking up 'report.txt'...
+✗ ERROR: Storage Server hosting 'report.txt' is offline.
+```
+
+### Expected Output (STREAM)
+```
+alice@docs++ > STREAM report.txt
+  Looking up 'report.txt'...
+
+─── STREAM: report.txt ─────────────────────────────
+Hello from Docs++ NFS. This is a direct data stream test.
+─────────────────────────────────────────────────
+```
+
+---
+
+## Feature DELETE (System-Wide & Replication Eviction)
+
+- **System-Wide Eviction**: Owners can delete their files. Deleting a file wipes the physical file from the active Storage Server and immediately evicts the entry from the Naming Server's lookup mapping so future client lookups instantly fail.
+- **Replication Eviction**: The delete command automatically cascades to clear all replica storage server copies of the file.
+
+### Expected Output (DELETE Success)
+```
+alice@docs++ > DELETE report.txt
+  Deleting file 'report.txt'...
+✓ File 'report.txt' deleted successfully.
+```
+
+### Expected Output (Non-owner Attempt)
+```
+bob@docs++ > DELETE report.txt
+  Deleting file 'report.txt'...
+✗ ERROR: Permission denied. Only the owner 'alice' can delete this file.
 ```
 
 ---

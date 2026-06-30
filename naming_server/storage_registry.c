@@ -377,3 +377,58 @@ void registry_load_metadata(void) {
     printf("[NM Registry] Loaded %d file(s) from persistent metadata.\n",
            g_file_count);
 }
+
+const char *registry_get_file_owner(const char *filename) {
+    pthread_mutex_lock(&registry_mutex);
+    FileMeta *m = find_meta(filename);
+    const char *owner = m ? m->owner : NULL;
+    pthread_mutex_unlock(&registry_mutex);
+    return owner;
+}
+
+int registry_delete_file(const char *filename, StorageServer *out_servers[], int *out_server_count) {
+    if (!filename) return -1;
+    unsigned long h = hash_file(filename) % REGISTRY_BUCKETS;
+    pthread_mutex_lock(&registry_mutex);
+
+    /* 1. Find and remove from hash-map */
+    FileMapNode *prev = NULL;
+    FileMapNode *curr = buckets[h];
+    int found_in_map = 0;
+    *out_server_count = 0;
+
+    while (curr) {
+        if (strcmp(curr->filename, filename) == 0) {
+            found_in_map = 1;
+            /* Copy the servers to output array */
+            *out_server_count = curr->server_count;
+            for (int i = 0; i < curr->server_count; ++i) {
+                out_servers[i] = curr->servers[i];
+            }
+            /* Remove from linked list */
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                buckets[h] = curr->next;
+            }
+            free(curr);
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    /* 2. Find and deactivate in metadata */
+    FileMeta *m = find_meta(filename);
+    if (m) {
+        m->active = 0;
+    }
+
+    pthread_mutex_unlock(&registry_mutex);
+
+    if (found_in_map || m) {
+        registry_save_metadata();
+        return 0; /* success */
+    }
+    return -1; /* file not found */
+}
