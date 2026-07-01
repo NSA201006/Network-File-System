@@ -463,6 +463,23 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
     send_struct(fd, &resp, sizeof(resp));
 }
 
+static void handle_update_stats(int fd, int32_t cmd_type, const char *peer_ip) {
+    SSUpdateStatsPacket packet;
+    packet.command_type = cmd_type;
+    if (recv_struct(fd,
+                    ((char *)&packet) + sizeof(int32_t),
+                    sizeof(packet)    - sizeof(int32_t)) != 0) {
+        nm_log("Failed to receive SSUpdateStatsPacket from %s", peer_ip);
+        return;
+    }
+
+    nm_log("UPDATE_STATS: file='%s' words=%d chars=%d size=%lld from %s",
+           packet.filename, packet.word_count, packet.char_count, (long long)packet.size_bytes, peer_ip);
+
+    registry_update_file_stats(packet.filename, packet.word_count, packet.char_count, packet.size_bytes);
+    registry_save_metadata();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Main connection dispatcher
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -497,6 +514,9 @@ static void *handle_connection(void *arg) {
             break;
         case CMD_DELETE:
             handle_delete(fd, cmd_type, peer_ip);
+            break;
+        case CMD_SS_UPDATE_STATS:
+            handle_update_stats(fd, cmd_type, peer_ip);
             break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);

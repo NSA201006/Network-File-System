@@ -361,6 +361,116 @@ static void cmd_delete(const char *username, const char *filename) {
     }
 }
 
+static void cmd_write(const char *username, const char *filename, int sentence_number) {
+    if (sentence_number < 0) {
+        print_err("ERROR: Sentence index out of range.");
+        return;
+    }
+    
+    char ss_ip[MAX_IP_LEN] = {0};
+    int ss_port = 0;
+    
+    printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
+    if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
+    
+    int ss_fd = connect_to_server(ss_ip, ss_port);
+    if (ss_fd < 0) {
+        print_err("Cannot connect to Storage Server.");
+        return;
+    }
+    
+    WriteStartPacket start_pkt;
+    memset(&start_pkt, 0, sizeof(start_pkt));
+    start_pkt.command_type = CMD_WRITE;
+    strncpy(start_pkt.filename, filename, MAX_FILENAME - 1);
+    start_pkt.sentence_number = sentence_number;
+    
+    if (send_struct(ss_fd, &start_pkt, sizeof(start_pkt)) < 0) {
+        print_err("Failed to send WRITE request.");
+        close(ss_fd);
+        return;
+    }
+    
+    WriteStartResponse start_resp;
+    if (recv_struct(ss_fd, &start_resp, sizeof(start_resp)) < 0) {
+        print_err("No response from Storage Server.");
+        close(ss_fd);
+        return;
+    }
+    
+    if (start_resp.status != ERR_OK) {
+        print_err(start_resp.message);
+        close(ss_fd);
+        return;
+    }
+    
+    char line[1024];
+    while (1) {
+        printf("Client: ");
+        fflush(stdout);
+        
+        if (!fgets(line, sizeof(line), stdin)) {
+            break;
+        }
+        
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        
+        char *trimmed = trim(line);
+        if (trimmed[0] == '\0') continue;
+        
+        WriteUpdatePacket update_pkt;
+        memset(&update_pkt, 0, sizeof(update_pkt));
+        
+        if (strcasecmp(trimmed, "ETIRW") == 0) {
+            update_pkt.word_index = -1;
+            if (send_struct(ss_fd, &update_pkt, sizeof(update_pkt)) < 0) {
+                print_err("Failed to send ETIRW commit.");
+                break;
+            }
+            
+            WriteUpdateResponse upd_resp;
+            if (recv_struct(ss_fd, &upd_resp, sizeof(upd_resp)) < 0) {
+                print_err("Failed to receive commit acknowledgment.");
+                break;
+            }
+            if (upd_resp.status == ERR_OK) {
+                print_ok(upd_resp.message);
+            } else {
+                print_err(upd_resp.message);
+            }
+            break;
+        } else {
+            char *endptr;
+            long val = strtol(trimmed, &endptr, 10);
+            if (endptr == trimmed || !isspace((unsigned char)*endptr)) {
+                print_err("Invalid format. Usage: <word_index> <content> or ETIRW");
+                continue;
+            }
+            
+            update_pkt.word_index = (int32_t)val;
+            char *content = trim(endptr);
+            strncpy(update_pkt.content, content, MAX_MESSAGE - 1);
+            
+            if (send_struct(ss_fd, &update_pkt, sizeof(update_pkt)) < 0) {
+                print_err("Failed to send update.");
+                break;
+            }
+            
+            WriteUpdateResponse upd_resp;
+            if (recv_struct(ss_fd, &upd_resp, sizeof(upd_resp)) < 0) {
+                print_err("Failed to receive update acknowledgment.");
+                break;
+            }
+            if (upd_resp.status != ERR_OK) {
+                print_err(upd_resp.message);
+                break;
+            }
+        }
+    }
+    close(ss_fd);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  CREATE command  [Feature 1 — NEW]
  *
@@ -540,6 +650,7 @@ static void print_help(void) {
     printf("  " CLR_BOLD "VIEW -al" CLR_RESET "           All files with full details\n");
     printf("  " CLR_BOLD "READ" CLR_RESET " <filename>    Read and display a file's contents\n");
     printf("  " CLR_BOLD "STREAM" CLR_RESET " <filename>  Stream a file's contents word-by-word with delay\n");
+    printf("  " CLR_BOLD "WRITE" CLR_RESET " <filename> <sentence_num>  Edit a file at word/sentence level\n");
     printf("  " CLR_BOLD "DELETE" CLR_RESET " <filename>  Delete a file from the NFS (owner only)\n");
     printf("  " CLR_BOLD "exit" CLR_RESET " / " CLR_BOLD "quit" CLR_RESET "       Disconnect\n");
     printf(CLR_CYAN "  ────────────────────────────────────────────────────\n\n" CLR_RESET);
@@ -580,6 +691,31 @@ static void repl(const char *username) {
         if (strncasecmp(cmd, "CREATE ", 7) == 0) {
             char *fname = trim(cmd + 7);
             cmd_create(username, fname);
+            continue;
+        }
+
+        /* ── WRITE <filename> <sentence_number> ── */
+        if (strncasecmp(cmd, "WRITE ", 6) == 0) {
+            char *rest = trim(cmd + 6);
+            char fname[MAX_FILENAME] = {0};
+            int sentence_num = -1;
+            
+            char *space = strchr(rest, ' ');
+            if (!space) {
+                print_err("Usage: WRITE <filename> <sentence_number>");
+                continue;
+            }
+            
+            *space = '\0';
+            strncpy(fname, rest, MAX_FILENAME - 1);
+            char *num_str = trim(space + 1);
+            if (num_str[0] == '\0') {
+                print_err("Usage: WRITE <filename> <sentence_number>");
+                continue;
+            }
+            
+            sentence_num = atoi(num_str);
+            cmd_write(username, fname, sentence_num);
             continue;
         }
 

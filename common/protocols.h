@@ -68,7 +68,12 @@ typedef enum {
     CMD_DELETE               = 18,   /* Client  → NM  */
     CMD_DELETE_RESP          = 19,   /* NM      → Client */
     CMD_SS_DELETE            = 20,   /* NM      → SS  */
-    CMD_SS_DELETE_ACK        = 21    /* SS      → NM  */
+    CMD_SS_DELETE_ACK        = 21,   /* SS      → NM  */
+
+    /* ── WRITE / ETIRW ── */
+    CMD_WRITE                = 22,
+    CMD_WRITE_RESP           = 23,
+    CMD_SS_UPDATE_STATS      = 24
 } CommandType;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -219,5 +224,37 @@ typedef struct {
     int32_t status;                            /* ERR_OK or error code */
     char    message[MAX_MESSAGE];
 } SSDeleteAck;
+
+/* ── WRITE / ETIRW ── */
+#define ERR_OUT_OF_RANGE -8
+
+typedef struct {
+    int32_t command_type;                      /* CMD_WRITE */
+    char    filename[MAX_FILENAME];
+    int32_t sentence_number;
+} WriteStartPacket;
+
+typedef struct {
+    int32_t status;                            /* ERR_OK or error */
+    char    message[MAX_MESSAGE];
+} WriteStartResponse;
+
+typedef struct {
+    int32_t word_index;                        /* -1 for ETIRW */
+    char    content[MAX_MESSAGE];
+} WriteUpdatePacket;
+
+typedef struct {
+    int32_t status;
+    char    message[MAX_MESSAGE];
+} WriteUpdateResponse;
+
+typedef struct {
+    int32_t command_type;                      /* CMD_SS_UPDATE_STATS */
+    char    filename[MAX_FILENAME];
+    int32_t word_count;
+    int32_t char_count;
+    int64_t size_bytes;
+} SSUpdateStatsPacket;
 
 #endif /* PROTOCOLS_H */

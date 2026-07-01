@@ -232,7 +232,387 @@ static void handle_ss_delete(int fd, int32_t cmd_type) {
                  "File '%s' deleted from SS disk.", req.filename);
         ss_log("DELETE OK: '%s' physically removed.", req.filename);
     }
-    send_struct(fd, &ack, sizeof(ack));
+}
+
+#define MAX_SENTENCE_WORDS 256
+#define MAX_SENTENCES 512
+
+typedef struct {
+    char words[MAX_SENTENCE_WORDS][MAX_FILENAME];
+    int  word_count;
+    int  ends_with_delimiter;
+} Sentence;
+
+typedef struct {
+    Sentence sentences[MAX_SENTENCES];
+    int      sentence_count;
+} FileContent;
+
+static void parse_file_content(const char *text, FileContent *fc) {
+    memset(fc, 0, sizeof(FileContent));
+    int len = strlen(text);
+    char curr_word[512];
+    int curr_word_len = 0;
+    
+    int s_idx = 0;
+    Sentence *curr_s = &fc->sentences[s_idx];
+    curr_s->word_count = 0;
+    curr_s->ends_with_delimiter = 0;
+    
+    for (int i = 0; i <= len; i++) {
+        char c = text[i];
+        
+        if (c == '\0') {
+            if (curr_word_len > 0) {
+                curr_word[curr_word_len] = '\0';
+                strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
+                curr_s->word_count++;
+                curr_word_len = 0;
+            }
+            if (curr_s->word_count > 0) {
+                s_idx++;
+            }
+            break;
+        }
+        
+        if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+            if (curr_word_len > 0) {
+                curr_word[curr_word_len] = '\0';
+                strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
+                curr_s->word_count++;
+                curr_word_len = 0;
+            }
+        } else if (c == '.' || c == '!' || c == '?') {
+            curr_word[curr_word_len++] = c;
+            curr_word[curr_word_len] = '\0';
+            
+            strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
+            curr_s->word_count++;
+            curr_s->ends_with_delimiter = 1;
+            curr_word_len = 0;
+            
+            s_idx++;
+            if (s_idx >= MAX_SENTENCES) break;
+            curr_s = &fc->sentences[s_idx];
+            curr_s->word_count = 0;
+            curr_s->ends_with_delimiter = 0;
+        } else {
+            if (curr_word_len < 511) {
+                curr_word[curr_word_len++] = c;
+            }
+        }
+    }
+    fc->sentence_count = s_idx;
+}
+
+static void reconstruct_file_content(const FileContent *fc, char **out_buf, long *out_len) {
+    long capacity = 4096;
+    char *buf = malloc(capacity);
+    long len = 0;
+    buf[0] = '\0';
+    
+    for (int i = 0; i < fc->sentence_count; i++) {
+        const Sentence *s = &fc->sentences[i];
+        for (int j = 0; j < s->word_count; j++) {
+            long word_len = strlen(s->words[j]);
+            while (len + word_len + 2 >= capacity) {
+                capacity *= 2;
+                buf = realloc(buf, capacity);
+            }
+            if (len > 0) {
+                buf[len++] = ' ';
+            }
+            memcpy(buf + len, s->words[j], word_len);
+            len += word_len;
+        }
+    }
+    buf[len] = '\0';
+    *out_buf = buf;
+    *out_len = len;
+}
+
+static int insert_content_at_index(FileContent *fc, int sentence_number, int word_index, const char *content) {
+    FileContent *temp_fc = malloc(sizeof(FileContent));
+    if (!temp_fc) return -1;
+    parse_file_content(content, temp_fc);
+    if (temp_fc->sentence_count == 0) {
+        free(temp_fc);
+        return 0;
+    }
+    
+    int has_delimiter = 0;
+    for (int i = 0; i < temp_fc->sentence_count; i++) {
+        if (temp_fc->sentences[i].ends_with_delimiter) {
+            has_delimiter = 1;
+            break;
+        }
+    }
+    
+    if (temp_fc->sentence_count == 1 && !has_delimiter) {
+        Sentence *s = &fc->sentences[sentence_number];
+        int ins_words = temp_fc->sentences[0].word_count;
+        if (s->word_count + ins_words >= MAX_SENTENCE_WORDS) {
+            free(temp_fc);
+            return -1;
+        }
+        
+        memmove(&s->words[word_index + ins_words], &s->words[word_index], (s->word_count - word_index) * MAX_FILENAME);
+        for (int i = 0; i < ins_words; i++) {
+            strncpy(s->words[word_index + i], temp_fc->sentences[0].words[i], MAX_FILENAME - 1);
+        }
+        s->word_count += ins_words;
+        free(temp_fc);
+        return 0;
+    } else {
+        Sentence orig_s = fc->sentences[sentence_number];
+        int W_orig = orig_s.word_count;
+        
+        Sentence s_before;
+        memset(&s_before, 0, sizeof(s_before));
+        s_before.word_count = word_index;
+        for (int i = 0; i < word_index; i++) {
+            strcpy(s_before.words[i], orig_s.words[i]);
+        }
+        
+        Sentence s_after;
+        memset(&s_after, 0, sizeof(s_after));
+        s_after.word_count = W_orig - word_index;
+        for (int i = 0; i < s_after.word_count; i++) {
+            strcpy(s_after.words[i], orig_s.words[word_index + i]);
+        }
+        s_after.ends_with_delimiter = orig_s.ends_with_delimiter;
+        
+        Sentence *new_sentences = malloc(MAX_SENTENCES * sizeof(Sentence));
+        if (!new_sentences) {
+            free(temp_fc);
+            return -1;
+        }
+        int new_count = 0;
+        
+        if (temp_fc->sentence_count == 1) {
+            Sentence *ns0 = &new_sentences[new_count++];
+            ns0->word_count = s_before.word_count + temp_fc->sentences[0].word_count;
+            for (int i = 0; i < s_before.word_count; i++) strcpy(ns0->words[i], s_before.words[i]);
+            for (int i = 0; i < temp_fc->sentences[0].word_count; i++) strcpy(ns0->words[s_before.word_count + i], temp_fc->sentences[0].words[i]);
+            ns0->ends_with_delimiter = 1;
+            
+            if (s_after.word_count > 0) {
+                Sentence *ns1 = &new_sentences[new_count++];
+                ns1->word_count = s_after.word_count;
+                for (int i = 0; i < s_after.word_count; i++) strcpy(ns1->words[i], s_after.words[i]);
+                ns1->ends_with_delimiter = s_after.ends_with_delimiter;
+            }
+        } else {
+            Sentence *ns0 = &new_sentences[new_count++];
+            ns0->word_count = s_before.word_count + temp_fc->sentences[0].word_count;
+            for (int i = 0; i < s_before.word_count; i++) strcpy(ns0->words[i], s_before.words[i]);
+            for (int i = 0; i < temp_fc->sentences[0].word_count; i++) strcpy(ns0->words[s_before.word_count + i], temp_fc->sentences[0].words[i]);
+            ns0->ends_with_delimiter = 1;
+            
+            for (int i = 1; i < temp_fc->sentence_count - 1; i++) {
+                Sentence *nsi = &new_sentences[new_count++];
+                *nsi = temp_fc->sentences[i];
+            }
+            
+            Sentence *nsl = &new_sentences[new_count++];
+            int last_idx = temp_fc->sentence_count - 1;
+            nsl->word_count = temp_fc->sentences[last_idx].word_count + s_after.word_count;
+            for (int i = 0; i < temp_fc->sentences[last_idx].word_count; i++) strcpy(nsl->words[i], temp_fc->sentences[last_idx].words[i]);
+            for (int i = 0; i < s_after.word_count; i++) strcpy(nsl->words[temp_fc->sentences[last_idx].word_count + i], s_after.words[i]);
+            nsl->ends_with_delimiter = (s_after.word_count > 0) ? s_after.ends_with_delimiter : temp_fc->sentences[last_idx].ends_with_delimiter;
+        }
+        
+        if (fc->sentence_count + new_count - 1 >= MAX_SENTENCES) {
+            free(new_sentences);
+            free(temp_fc);
+            return -1;
+        }
+        
+        int num_to_shift = fc->sentence_count - (sentence_number + 1);
+        if (num_to_shift > 0) {
+            memmove(&fc->sentences[sentence_number + new_count], &fc->sentences[sentence_number + 1], num_to_shift * sizeof(Sentence));
+        }
+        for (int i = 0; i < new_count; i++) {
+            fc->sentences[sentence_number + i] = new_sentences[i];
+        }
+        fc->sentence_count += new_count - 1;
+        
+        free(new_sentences);
+        free(temp_fc);
+        return 0;
+    }
+}
+
+static void handle_write(int fd, int32_t cmd_type) {
+    WriteStartPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd,
+                    ((char *)&req) + sizeof(int32_t),
+                    sizeof(req)    - sizeof(int32_t)) != 0) {
+        ss_log("Failed to receive WriteStartPacket.");
+        return;
+    }
+    
+    ss_log("WRITE start: file='%s' sentence=%d", req.filename, req.sentence_number);
+    
+    WriteStartResponse resp;
+    memset(&resp, 0, sizeof(resp));
+    
+    if (contains_path_traversal(req.filename)) {
+        resp.status = ERR_INTERNAL;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Invalid filename '%s'.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+    
+    char *buffer = NULL;
+    long length = 0;
+    if (read_file_into_buffer(g_storage_dir, req.filename, &buffer, &length) < 0) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: File '%s' not found.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+    
+    FileContent *fc = malloc(sizeof(FileContent));
+    if (!fc) {
+        resp.status = ERR_INTERNAL;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Out of memory.");
+        send_struct(fd, &resp, sizeof(resp));
+        free(buffer);
+        return;
+    }
+    parse_file_content(buffer, fc);
+    free(buffer);
+    
+    int N = fc->sentence_count;
+    int valid = 0;
+    if (N == 0) {
+        if (req.sentence_number == 0) valid = 1;
+    } else {
+        int ends_with_del = fc->sentences[N - 1].ends_with_delimiter;
+        if (ends_with_del) {
+            if (req.sentence_number >= 0 && req.sentence_number <= N) valid = 1;
+        } else {
+            if (req.sentence_number >= 0 && req.sentence_number < N) valid = 1;
+        }
+    }
+    
+    if (!valid) {
+        resp.status = ERR_OUT_OF_RANGE;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Sentence index out of range.");
+        send_struct(fd, &resp, sizeof(resp));
+        free(fc);
+        return;
+    }
+    
+    if (req.sentence_number == N) {
+        if (N >= MAX_SENTENCES) {
+            resp.status = ERR_INTERNAL;
+            snprintf(resp.message, sizeof(resp.message), "ERROR: Max sentences reached.");
+            send_struct(fd, &resp, sizeof(resp));
+            free(fc);
+            return;
+        }
+        memset(&fc->sentences[N], 0, sizeof(Sentence));
+        fc->sentence_count++;
+    }
+    
+    resp.status = ERR_OK;
+    snprintf(resp.message, sizeof(resp.message), "OK");
+    if (send_struct(fd, &resp, sizeof(resp)) < 0) {
+        free(fc);
+        return;
+    }
+    
+    while (1) {
+        WriteUpdatePacket update;
+        if (recv_struct(fd, &update, sizeof(update)) < 0) {
+            ss_log("Connection lost during WRITE session.");
+            break;
+        }
+        
+        if (update.word_index == -1) {
+            char *new_content = NULL;
+            long new_len = 0;
+            reconstruct_file_content(fc, &new_content, &new_len);
+            
+            char path[MAX_PATH_LEN];
+            snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+            FILE *f = fopen(path, "w");
+            if (!f) {
+                WriteUpdateResponse upd_resp;
+                upd_resp.status = ERR_INTERNAL;
+                snprintf(upd_resp.message, sizeof(upd_resp.message), "ERROR: Failed to save file.");
+                send_struct(fd, &upd_resp, sizeof(upd_resp));
+                free(new_content);
+                break;
+            }
+            if (new_len > 0) {
+                fwrite(new_content, 1, new_len, f);
+            }
+            fclose(f);
+            free(new_content);
+            
+            int words = 0, chars = 0;
+            long bytes = 0;
+            count_file_stats(g_storage_dir, req.filename, &words, &chars, &bytes);
+            
+            int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
+            if (nm_fd >= 0) {
+                SSUpdateStatsPacket stats_pkt;
+                stats_pkt.command_type = CMD_SS_UPDATE_STATS;
+                strncpy(stats_pkt.filename, req.filename, MAX_FILENAME - 1);
+                stats_pkt.word_count = words;
+                stats_pkt.char_count = chars;
+                stats_pkt.size_bytes = bytes;
+                send_struct(nm_fd, &stats_pkt, sizeof(stats_pkt));
+                close(nm_fd);
+                ss_log("Sent updated stats for '%s' to NM: words=%d chars=%d bytes=%ld",
+                       req.filename, words, chars, bytes);
+            } else {
+                ss_log("Warning: could not connect to NM to update stats.");
+            }
+            
+            WriteUpdateResponse upd_resp;
+            upd_resp.status = ERR_OK;
+            snprintf(upd_resp.message, sizeof(upd_resp.message), "Write Successful!");
+            send_struct(fd, &upd_resp, sizeof(upd_resp));
+            break;
+        } else {
+            int word_idx = update.word_index;
+            Sentence *s = &fc->sentences[req.sentence_number];
+            int W = s->word_count;
+            
+            if (W == 0 && word_idx == 1) {
+                word_idx = 0;
+            }
+            
+            if (word_idx < 0 || word_idx > W) {
+                WriteUpdateResponse upd_resp;
+                upd_resp.status = ERR_OUT_OF_RANGE;
+                snprintf(upd_resp.message, sizeof(upd_resp.message), "ERROR: Word index out of range.");
+                send_struct(fd, &upd_resp, sizeof(upd_resp));
+                break;
+            }
+            
+            if (insert_content_at_index(fc, req.sentence_number, word_idx, update.content) < 0) {
+                WriteUpdateResponse upd_resp;
+                upd_resp.status = ERR_INTERNAL;
+                snprintf(upd_resp.message, sizeof(upd_resp.message), "ERROR: Internal limit exceeded during insert.");
+                send_struct(fd, &upd_resp, sizeof(upd_resp));
+                break;
+            }
+            
+            WriteUpdateResponse upd_resp;
+            upd_resp.status = ERR_OK;
+            snprintf(upd_resp.message, sizeof(upd_resp.message), "OK");
+            if (send_struct(fd, &upd_resp, sizeof(upd_resp)) < 0) {
+                break;
+            }
+        }
+    }
+    free(fc);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -255,7 +635,6 @@ static void *handle_client_connection(void *arg) {
     }
 
     if (cmd_type == CMD_FILE_READ) {
-        /* Read the filename (client sends it after the cmd_type) */
         char filename[MAX_FILENAME] = {0};
         if (recv_all(fd, filename, sizeof(filename)) < 0) {
             close(fd);
@@ -268,6 +647,9 @@ static void *handle_client_connection(void *arg) {
 
     } else if (cmd_type == CMD_SS_DELETE) {
         handle_ss_delete(fd, cmd_type);
+
+    } else if (cmd_type == CMD_WRITE) {
+        handle_write(fd, cmd_type);
 
     } else {
         ss_log("Unknown command %d — ignored.", cmd_type);

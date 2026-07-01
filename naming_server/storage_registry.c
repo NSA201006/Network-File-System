@@ -303,6 +303,7 @@ void registry_update_file_stats(const char *filename,
         m->char_count = chars;
         m->size_bytes = size;
         m->atime      = (int64_t)time(NULL);
+        m->mtime      = (int64_t)time(NULL);
     }
     pthread_mutex_unlock(&registry_mutex);
 }

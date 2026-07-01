@@ -81,6 +81,7 @@ mkdir -p ss_storage2 && echo "hello from ss2" > ss_storage2/file2.txt
 | `VIEW -al` | **Feature 4** | All files with full details |
 | `READ <filename>` | **READ** | Direct chunked read & display a file's contents |
 | `STREAM <filename>` | **READ** | Word-by-word content streaming with 0.1s delay |
+| `WRITE <filename> <sentence_num>` | **WRITE** | Edit a file at the word/sentence level |
 | `DELETE <filename>` | **DELETE**| Cascading deletion & NM tracking eviction (owner only) |
 | `help` | — | Show command reference |
 | `exit` | — | Disconnect |
@@ -176,6 +177,25 @@ alice@docs++ > DELETE report.txt
 bob@docs++ > DELETE report.txt
   Deleting file 'report.txt'...
 ✗ ERROR: Permission denied. Only the owner 'alice' can delete this file.
+```
+
+---
+
+## Feature WRITE & ETIRW (Word-Level Editing)
+
+- **Interactive Editing Session**: Users can update the content of a file at the word level. Initiating a write opens a direct connection to the hosting Storage Server.
+- **In-Memory Word/Sentence Tokenization**: The Storage Server splits the file content into dynamic sentences and words using `.`, `!`, and `?` as sentence delimiters.
+- **Dynamic Array Manipulation**: Insertions are handled using dynamic array shifts and splits. If an inserted word contains a delimiter, the sentence is split automatically.
+- **Commit on ETIRW**: Typing `ETIRW` finishes the write session, saves the file back to disk on the Storage Server, recalculates word count, character count, and file size, and pushes these statistics to the Naming Server.
+
+### Expected Output
+
+```
+alice@docs++ > WRITE report.txt 0
+  Looking up 'report.txt'...
+Client: 1 Hello from Docs++ NFS.
+Client: ETIRW
+✓ Write Successful!
 ```
 
 ---
