@@ -1,26 +1,13 @@
 /*
  * storage_server/main.c — Docs++ Storage Server (ss_server)
  *
- * Usage:
- *   ./ss_server <nm_ip> <nm_port> <ss_client_port> <storage_dir>
- *   e.g.: ./ss_server 127.0.0.1 5000 6000 ./ss_storage
- *
- * On startup:
- *   1. Scans <storage_dir> for existing files.
- *   2. Connects to NM and sends SS_Registration_Packet.
- *   3. Starts a background thread that sends heartbeats to NM_HEARTBEAT_PORT
- *      every 1.5 seconds.
- *   4. Listens on <ss_client_port> for incoming connections (from both NM and
- *      direct client ops).
+ * Usage: ./ss_server <nm_ip> <nm_port> <ss_client_port> <storage_dir>
  *
  * Dispatches on the first int32_t (command type):
- *   CMD_FILE_READ   → stream file content to client  (Y-K1n9 original)
- *   CMD_SS_CREATE   → create a new empty file        [NEW — Feature 1]
- *
- * Compile (as part of Makefile target ss_server):
- *   gcc -Wall -O2 -pthread \
- *       storage_server/main.c storage_server/file_handler.c common/utils.c \
- *       -o ss_server
+ *   CMD_FILE_READ  → stream file content to client
+ *   CMD_SS_CREATE  → create a new empty file
+ *   CMD_SS_DELETE  → delete a file from disk
+ *   CMD_WRITE      → interactive word-level editing session
  */
 
 #include "file_handler.h"
@@ -41,13 +28,13 @@
 #include <stdarg.h>
 #include <errno.h>
 
-/* ─── Globals set from argv ──────────────────────────────────────────────── */
+/* --- Globals (set from argv) ---------------------------------------------- */
 static char  g_nm_ip[MAX_IP_LEN]       = "127.0.0.1";
 static int   g_nm_port                 = NM_PORT;
 static int   g_client_port             = SS_DEFAULT_PORT;
 static char  g_storage_dir[MAX_PATH_LEN] = "./ss_storage";
 
-/* ─── Logging ────────────────────────────────────────────────────────────── */
+/* --- Logging -------------------------------------------------------------- */
 static void ss_log(const char *fmt, ...) {
     time_t now = time(NULL);
     char ts[32];
@@ -62,7 +49,7 @@ static void ss_log(const char *fmt, ...) {
     fflush(stdout);
 }
 
-/* ─── Security: block path traversal ─────────────────────────────────────── */
+/* --- Security: block path traversal --------------------------------------- */
 static int contains_path_traversal(const char *path) {
     if (!path) return 0;
     if (path[0] == '/') return 1;
@@ -72,15 +59,13 @@ static int contains_path_traversal(const char *path) {
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  CMD_FILE_READ handler  (Y-K1n9 original)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_FILE_READ ----------------------------------------------- */
 static void handle_file_read(int fd, const char *filename) {
     if (contains_path_traversal(filename)) {
         ss_log("Blocked path-traversal attempt: '%s'", filename);
         ReadResponseHeader hdr = {
             .command_type   = CMD_FILE_READ,
-            .status         = -1,
+            .status         = ERR_INTERNAL,
             .content_length = 0
         };
         send_struct(fd, &hdr, sizeof(hdr));
@@ -126,7 +111,7 @@ static void handle_file_read(int fd, const char *filename) {
         }
     }
 
-    /* Send STOP packet */
+    /* STOP packet */
     FileChunkPacket stop_chunk;
     memset(&stop_chunk, 0, sizeof(stop_chunk));
     stop_chunk.chunk_size = 0;
@@ -136,12 +121,7 @@ static void handle_file_read(int fd, const char *filename) {
     ss_log("READ '%s' — sent %ld bytes in chunks.", filename, length);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  CMD_SS_CREATE handler  [NEW — Feature 1]
- *
- *  NM sends SSCreatePacket (already has cmd_type consumed).
- *  SS creates empty file, sends SSCreateAck back to NM.
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_SS_CREATE ----------------------------------------------- */
 static void handle_ss_create(int fd, int32_t cmd_type) {
     SSCreatePacket req;
     req.command_type = cmd_type;
@@ -157,7 +137,6 @@ static void handle_ss_create(int fd, int32_t cmd_type) {
     SSCreateAck ack;
     memset(&ack, 0, sizeof(ack));
 
-    /* Security check */
     if (contains_path_traversal(req.filename)) {
         ack.status = ERR_INTERNAL;
         snprintf(ack.message, sizeof(ack.message),
@@ -182,9 +161,7 @@ static void handle_ss_create(int fd, int32_t cmd_type) {
     send_struct(fd, &ack, sizeof(ack));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  CMD_SS_DELETE handler
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_SS_DELETE ----------------------------------------------- */
 static void handle_ss_delete(int fd, int32_t cmd_type) {
     SSDeletePacket req;
     req.command_type = cmd_type;
@@ -200,7 +177,6 @@ static void handle_ss_delete(int fd, int32_t cmd_type) {
     SSDeleteAck ack;
     memset(&ack, 0, sizeof(ack));
 
-    /* Security check */
     if (contains_path_traversal(req.filename)) {
         ack.status = ERR_INTERNAL;
         snprintf(ack.message, sizeof(ack.message),
@@ -210,20 +186,20 @@ static void handle_ss_delete(int fd, int32_t cmd_type) {
         return;
     }
 
-    /* Delete physical file */
-    char path[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
     snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
 
     if (remove(path) != 0) {
         if (errno == ENOENT) {
-            ack.status = ERR_OK; /* already gone */
+            ack.status = ERR_OK;
             snprintf(ack.message, sizeof(ack.message),
                      "File '%s' was not on disk (already evicted).", req.filename);
             ss_log("DELETE: '%s' not on disk, treating as deleted.", req.filename);
         } else {
             ack.status = ERR_INTERNAL;
             snprintf(ack.message, sizeof(ack.message),
-                     "ERROR: Failed to delete '%s' from disk: %s.", req.filename, strerror(errno));
+                     "ERROR: Failed to delete '%s' from disk: %s.",
+                     req.filename, strerror(errno));
             ss_log("DELETE failed for '%s': %s", req.filename, strerror(errno));
         }
     } else {
@@ -232,7 +208,12 @@ static void handle_ss_delete(int fd, int32_t cmd_type) {
                  "File '%s' deleted from SS disk.", req.filename);
         ss_log("DELETE OK: '%s' physically removed.", req.filename);
     }
+    send_struct(fd, &ack, sizeof(ack));
 }
+
+/* ==========================================================================
+ *  WRITE / ETIRW — word-level editing
+ * ========================================================================== */
 
 #define MAX_SENTENCE_WORDS 256
 #define MAX_SENTENCES 512
@@ -253,15 +234,15 @@ static void parse_file_content(const char *text, FileContent *fc) {
     int len = strlen(text);
     char curr_word[512];
     int curr_word_len = 0;
-    
+
     int s_idx = 0;
     Sentence *curr_s = &fc->sentences[s_idx];
     curr_s->word_count = 0;
     curr_s->ends_with_delimiter = 0;
-    
+
     for (int i = 0; i <= len; i++) {
         char c = text[i];
-        
+
         if (c == '\0') {
             if (curr_word_len > 0) {
                 curr_word[curr_word_len] = '\0';
@@ -274,7 +255,7 @@ static void parse_file_content(const char *text, FileContent *fc) {
             }
             break;
         }
-        
+
         if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
             if (curr_word_len > 0) {
                 curr_word[curr_word_len] = '\0';
@@ -285,12 +266,12 @@ static void parse_file_content(const char *text, FileContent *fc) {
         } else if (c == '.' || c == '!' || c == '?') {
             curr_word[curr_word_len++] = c;
             curr_word[curr_word_len] = '\0';
-            
+
             strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
             curr_s->word_count++;
             curr_s->ends_with_delimiter = 1;
             curr_word_len = 0;
-            
+
             s_idx++;
             if (s_idx >= MAX_SENTENCES) break;
             curr_s = &fc->sentences[s_idx];
@@ -310,7 +291,7 @@ static void reconstruct_file_content(const FileContent *fc, char **out_buf, long
     char *buf = malloc(capacity);
     long len = 0;
     buf[0] = '\0';
-    
+
     for (int i = 0; i < fc->sentence_count; i++) {
         const Sentence *s = &fc->sentences[i];
         for (int j = 0; j < s->word_count; j++) {
@@ -339,7 +320,7 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
         free(temp_fc);
         return 0;
     }
-    
+
     int has_delimiter = 0;
     for (int i = 0; i < temp_fc->sentence_count; i++) {
         if (temp_fc->sentences[i].ends_with_delimiter) {
@@ -347,7 +328,7 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
             break;
         }
     }
-    
+
     if (temp_fc->sentence_count == 1 && !has_delimiter) {
         Sentence *s = &fc->sentences[sentence_number];
         int ins_words = temp_fc->sentences[0].word_count;
@@ -355,8 +336,9 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
             free(temp_fc);
             return -1;
         }
-        
-        memmove(&s->words[word_index + ins_words], &s->words[word_index], (s->word_count - word_index) * MAX_FILENAME);
+
+        memmove(&s->words[word_index + ins_words], &s->words[word_index],
+                (s->word_count - word_index) * MAX_FILENAME);
         for (int i = 0; i < ins_words; i++) {
             strncpy(s->words[word_index + i], temp_fc->sentences[0].words[i], MAX_FILENAME - 1);
         }
@@ -366,14 +348,14 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
     } else {
         Sentence orig_s = fc->sentences[sentence_number];
         int W_orig = orig_s.word_count;
-        
+
         Sentence s_before;
         memset(&s_before, 0, sizeof(s_before));
         s_before.word_count = word_index;
         for (int i = 0; i < word_index; i++) {
             strcpy(s_before.words[i], orig_s.words[i]);
         }
-        
+
         Sentence s_after;
         memset(&s_after, 0, sizeof(s_after));
         s_after.word_count = W_orig - word_index;
@@ -381,21 +363,21 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
             strcpy(s_after.words[i], orig_s.words[word_index + i]);
         }
         s_after.ends_with_delimiter = orig_s.ends_with_delimiter;
-        
+
         Sentence *new_sentences = malloc(MAX_SENTENCES * sizeof(Sentence));
         if (!new_sentences) {
             free(temp_fc);
             return -1;
         }
         int new_count = 0;
-        
+
         if (temp_fc->sentence_count == 1) {
             Sentence *ns0 = &new_sentences[new_count++];
             ns0->word_count = s_before.word_count + temp_fc->sentences[0].word_count;
             for (int i = 0; i < s_before.word_count; i++) strcpy(ns0->words[i], s_before.words[i]);
             for (int i = 0; i < temp_fc->sentences[0].word_count; i++) strcpy(ns0->words[s_before.word_count + i], temp_fc->sentences[0].words[i]);
             ns0->ends_with_delimiter = 1;
-            
+
             if (s_after.word_count > 0) {
                 Sentence *ns1 = &new_sentences[new_count++];
                 ns1->word_count = s_after.word_count;
@@ -408,12 +390,12 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
             for (int i = 0; i < s_before.word_count; i++) strcpy(ns0->words[i], s_before.words[i]);
             for (int i = 0; i < temp_fc->sentences[0].word_count; i++) strcpy(ns0->words[s_before.word_count + i], temp_fc->sentences[0].words[i]);
             ns0->ends_with_delimiter = 1;
-            
+
             for (int i = 1; i < temp_fc->sentence_count - 1; i++) {
                 Sentence *nsi = &new_sentences[new_count++];
                 *nsi = temp_fc->sentences[i];
             }
-            
+
             Sentence *nsl = &new_sentences[new_count++];
             int last_idx = temp_fc->sentence_count - 1;
             nsl->word_count = temp_fc->sentences[last_idx].word_count + s_after.word_count;
@@ -421,22 +403,24 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
             for (int i = 0; i < s_after.word_count; i++) strcpy(nsl->words[temp_fc->sentences[last_idx].word_count + i], s_after.words[i]);
             nsl->ends_with_delimiter = (s_after.word_count > 0) ? s_after.ends_with_delimiter : temp_fc->sentences[last_idx].ends_with_delimiter;
         }
-        
+
         if (fc->sentence_count + new_count - 1 >= MAX_SENTENCES) {
             free(new_sentences);
             free(temp_fc);
             return -1;
         }
-        
+
         int num_to_shift = fc->sentence_count - (sentence_number + 1);
         if (num_to_shift > 0) {
-            memmove(&fc->sentences[sentence_number + new_count], &fc->sentences[sentence_number + 1], num_to_shift * sizeof(Sentence));
+            memmove(&fc->sentences[sentence_number + new_count],
+                    &fc->sentences[sentence_number + 1],
+                    num_to_shift * sizeof(Sentence));
         }
         for (int i = 0; i < new_count; i++) {
             fc->sentences[sentence_number + i] = new_sentences[i];
         }
         fc->sentence_count += new_count - 1;
-        
+
         free(new_sentences);
         free(temp_fc);
         return 0;
@@ -452,28 +436,30 @@ static void handle_write(int fd, int32_t cmd_type) {
         ss_log("Failed to receive WriteStartPacket.");
         return;
     }
-    
+
     ss_log("WRITE start: file='%s' sentence=%d", req.filename, req.sentence_number);
-    
+
     WriteStartResponse resp;
     memset(&resp, 0, sizeof(resp));
-    
+
     if (contains_path_traversal(req.filename)) {
         resp.status = ERR_INTERNAL;
-        snprintf(resp.message, sizeof(resp.message), "ERROR: Invalid filename '%s'.", req.filename);
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: Invalid filename '%s'.", req.filename);
         send_struct(fd, &resp, sizeof(resp));
         return;
     }
-    
+
     char *buffer = NULL;
     long length = 0;
     if (read_file_into_buffer(g_storage_dir, req.filename, &buffer, &length) < 0) {
         resp.status = ERR_FILE_NOT_FOUND;
-        snprintf(resp.message, sizeof(resp.message), "ERROR: File '%s' not found.", req.filename);
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: File '%s' not found.", req.filename);
         send_struct(fd, &resp, sizeof(resp));
         return;
     }
-    
+
     FileContent *fc = malloc(sizeof(FileContent));
     if (!fc) {
         resp.status = ERR_INTERNAL;
@@ -484,7 +470,7 @@ static void handle_write(int fd, int32_t cmd_type) {
     }
     parse_file_content(buffer, fc);
     free(buffer);
-    
+
     int N = fc->sentence_count;
     int valid = 0;
     if (N == 0) {
@@ -497,19 +483,21 @@ static void handle_write(int fd, int32_t cmd_type) {
             if (req.sentence_number >= 0 && req.sentence_number < N) valid = 1;
         }
     }
-    
+
     if (!valid) {
         resp.status = ERR_OUT_OF_RANGE;
-        snprintf(resp.message, sizeof(resp.message), "ERROR: Sentence index out of range.");
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: Sentence index out of range.");
         send_struct(fd, &resp, sizeof(resp));
         free(fc);
         return;
     }
-    
+
     if (req.sentence_number == N) {
         if (N >= MAX_SENTENCES) {
             resp.status = ERR_INTERNAL;
-            snprintf(resp.message, sizeof(resp.message), "ERROR: Max sentences reached.");
+            snprintf(resp.message, sizeof(resp.message),
+                     "ERROR: Max sentences reached.");
             send_struct(fd, &resp, sizeof(resp));
             free(fc);
             return;
@@ -517,33 +505,35 @@ static void handle_write(int fd, int32_t cmd_type) {
         memset(&fc->sentences[N], 0, sizeof(Sentence));
         fc->sentence_count++;
     }
-    
+
     resp.status = ERR_OK;
     snprintf(resp.message, sizeof(resp.message), "OK");
     if (send_struct(fd, &resp, sizeof(resp)) < 0) {
         free(fc);
         return;
     }
-    
+
     while (1) {
         WriteUpdatePacket update;
         if (recv_struct(fd, &update, sizeof(update)) < 0) {
             ss_log("Connection lost during WRITE session.");
             break;
         }
-        
+
         if (update.word_index == -1) {
+            /* ETIRW — commit */
             char *new_content = NULL;
             long new_len = 0;
             reconstruct_file_content(fc, &new_content, &new_len);
-            
-            char path[MAX_PATH_LEN];
+
+            char path[MAX_PATH_LEN + MAX_FILENAME + 2];
             snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
             FILE *f = fopen(path, "w");
             if (!f) {
                 WriteUpdateResponse upd_resp;
                 upd_resp.status = ERR_INTERNAL;
-                snprintf(upd_resp.message, sizeof(upd_resp.message), "ERROR: Failed to save file.");
+                snprintf(upd_resp.message, sizeof(upd_resp.message),
+                         "ERROR: Failed to save file.");
                 send_struct(fd, &upd_resp, sizeof(upd_resp));
                 free(new_content);
                 break;
@@ -553,11 +543,11 @@ static void handle_write(int fd, int32_t cmd_type) {
             }
             fclose(f);
             free(new_content);
-            
+
             int words = 0, chars = 0;
             long bytes = 0;
             count_file_stats(g_storage_dir, req.filename, &words, &chars, &bytes);
-            
+
             int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
             if (nm_fd >= 0) {
                 SSUpdateStatsPacket stats_pkt;
@@ -573,37 +563,40 @@ static void handle_write(int fd, int32_t cmd_type) {
             } else {
                 ss_log("Warning: could not connect to NM to update stats.");
             }
-            
+
             WriteUpdateResponse upd_resp;
             upd_resp.status = ERR_OK;
             snprintf(upd_resp.message, sizeof(upd_resp.message), "Write Successful!");
             send_struct(fd, &upd_resp, sizeof(upd_resp));
             break;
         } else {
+            /* Word insertion */
             int word_idx = update.word_index;
             Sentence *s = &fc->sentences[req.sentence_number];
             int W = s->word_count;
-            
+
             if (W == 0 && word_idx == 1) {
                 word_idx = 0;
             }
-            
+
             if (word_idx < 0 || word_idx > W) {
                 WriteUpdateResponse upd_resp;
                 upd_resp.status = ERR_OUT_OF_RANGE;
-                snprintf(upd_resp.message, sizeof(upd_resp.message), "ERROR: Word index out of range.");
+                snprintf(upd_resp.message, sizeof(upd_resp.message),
+                         "ERROR: Word index out of range.");
                 send_struct(fd, &upd_resp, sizeof(upd_resp));
                 break;
             }
-            
+
             if (insert_content_at_index(fc, req.sentence_number, word_idx, update.content) < 0) {
                 WriteUpdateResponse upd_resp;
                 upd_resp.status = ERR_INTERNAL;
-                snprintf(upd_resp.message, sizeof(upd_resp.message), "ERROR: Internal limit exceeded during insert.");
+                snprintf(upd_resp.message, sizeof(upd_resp.message),
+                         "ERROR: Internal limit exceeded during insert.");
                 send_struct(fd, &upd_resp, sizeof(upd_resp));
                 break;
             }
-            
+
             WriteUpdateResponse upd_resp;
             upd_resp.status = ERR_OK;
             snprintf(upd_resp.message, sizeof(upd_resp.message), "OK");
@@ -615,18 +608,10 @@ static void handle_write(int fd, int32_t cmd_type) {
     free(fc);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Per-connection thread
- * ═══════════════════════════════════════════════════════════════════════════ */
-typedef struct {
-    int  client_fd;
-    char storage_dir[MAX_PATH_LEN];
-} ClientConnection;
-
+/* --- Per-connection thread ------------------------------------------------ */
 static void *handle_client_connection(void *arg) {
-    ClientConnection *cc = (ClientConnection *)arg;
-    int fd = cc->client_fd;
-    free(cc);
+    int fd = *(int *)arg;
+    free(arg);
 
     int32_t cmd_type = 0;
     if (recv_all(fd, &cmd_type, sizeof(cmd_type)) < 0) {
@@ -659,7 +644,7 @@ static void *handle_client_connection(void *arg) {
     return NULL;
 }
 
-/* ─── Heartbeat sender ───────────────────────────────────────────────────── */
+/* --- Heartbeat sender ----------------------------------------------------- */
 typedef struct {
     char nm_ip[MAX_IP_LEN];
     int  nm_heartbeat_port;
@@ -671,7 +656,7 @@ static void *heartbeat_sender(void *arg) {
     HeartbeatPacket pkt;
     pkt.command_type = CMD_HEARTBEAT;
     pkt.port         = hpa->client_port;
-    strncpy(pkt.ip, g_nm_ip, MAX_IP_LEN - 1);  /* SS's own IP */
+    strncpy(pkt.ip, g_nm_ip, MAX_IP_LEN - 1);
 
     while (1) {
         usleep(1500000);  /* 1.5 seconds */
@@ -685,29 +670,26 @@ static void *heartbeat_sender(void *arg) {
     return NULL;
 }
 
-/* ─── Register with NM ───────────────────────────────────────────────────── */
+/* --- Register with NM ----------------------------------------------------- */
 static int register_with_nm(void) {
     SS_Registration_Packet packet;
     memset(&packet, 0, sizeof(packet));
     packet.command_type = CMD_REGISTER_SS;
-    packet.nm_port      = g_client_port;  /* port NM can reach this SS on */
+    packet.nm_port      = g_client_port;
     packet.client_port  = g_client_port;
 
-    /* Scan storage directory */
     if (scan_storage_directory(g_storage_dir, &packet) < 0) {
         ss_log("Warning: could not scan '%s' — registering with 0 files.",
                g_storage_dir);
         packet.file_count = 0;
     }
 
-    /* Connect for registration */
     int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
     if (nm_fd < 0) {
         fprintf(stderr, "[SS] Cannot connect to NM for registration.\n");
         return -1;
     }
-    
-    /* Determine this machine's IP (use NM connection source address) */
+
     struct sockaddr_in local;
     socklen_t len = sizeof(local);
     getsockname(nm_fd, (struct sockaddr *)&local, &len);
@@ -725,14 +707,13 @@ static int register_with_nm(void) {
     return 0;
 }
 
-/* ─── Main ───────────────────────────────────────────────────────────────── */
+/* --- Main ----------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     if (argc > 1) strncpy(g_nm_ip,       argv[1], MAX_IP_LEN - 1);
     if (argc > 2) g_nm_port    = atoi(argv[2]);
     if (argc > 3) g_client_port = atoi(argv[3]);
     if (argc > 4) strncpy(g_storage_dir, argv[4], MAX_PATH_LEN - 1);
 
-    /* Ensure storage directory exists */
     struct stat st;
     if (stat(g_storage_dir, &st) != 0) {
         mkdir(g_storage_dir, 0755);
@@ -744,7 +725,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Start heartbeat thread */
     HeartbeatPingArgs *hpa = malloc(sizeof(HeartbeatPingArgs));
     strncpy(hpa->nm_ip, g_nm_ip, MAX_IP_LEN - 1);
     hpa->nm_heartbeat_port = NM_HEARTBEAT_PORT;
@@ -753,7 +733,6 @@ int main(int argc, char *argv[]) {
     pthread_create(&hb_tid, NULL, heartbeat_sender, hpa);
     pthread_detach(hb_tid);
 
-    /* Listen for connections */
     int server_sock = create_server_socket(g_client_port);
     if (server_sock < 0) {
         fprintf(stderr, "[SS] Failed to bind port %d\n", g_client_port);
@@ -767,12 +746,11 @@ int main(int argc, char *argv[]) {
         int cfd = accept(server_sock, (struct sockaddr *)&addr, &alen);
         if (cfd < 0) continue;
 
-        ClientConnection *cc = malloc(sizeof(ClientConnection));
-        cc->client_fd = cfd;
-        strncpy(cc->storage_dir, g_storage_dir, MAX_PATH_LEN - 1);
+        int *fd_ptr = malloc(sizeof(int));
+        *fd_ptr = cfd;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, handle_client_connection, cc);
+        pthread_create(&tid, NULL, handle_client_connection, fd_ptr);
         pthread_detach(tid);
     }
 

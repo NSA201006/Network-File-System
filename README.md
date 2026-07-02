@@ -83,6 +83,7 @@ mkdir -p ss_storage2 && echo "hello from ss2" > ss_storage2/file2.txt
 | `STREAM <filename>` | **READ** | Word-by-word content streaming with 0.1s delay |
 | `WRITE <filename> <sentence_num>` | **WRITE** | Edit a file at the word/sentence level |
 | `DELETE <filename>` | **DELETE**| Cascading deletion & NM tracking eviction (owner only) |
+| `LIST` | **Feature 3** | Show all currently connected/registered users |
 | `help` | — | Show command reference |
 | `exit` | — | Disconnect |
 
@@ -200,6 +201,46 @@ Client: ETIRW
 
 ---
 
+## Feature 3 — LIST (Show Connected Users)
+
+Displays all registered clients currently connected to the Naming Server.
+
+### Expected Output
+```
+alice@docs++ > LIST
+
+  Connected Users:
+  Username              IP Address        Status  
+  ───────────────────   ───────────────   ────────
+  alice                 127.0.0.1         online  
+  bob                   127.0.0.1         online  
+
+  2 user(s) total.
+```
+
+---
+
+## Feature 5 — Comprehensive Error Codes
+
+Consolidates all error codes into a single, standardized set returned consistently across the system:
+
+| Code Value | Macro Symbol | Scenario |
+|:---:|---|---|
+| `0` | `ERR_OK` | Success |
+| `-1` | `ERR_NO_PERMISSION` | Unauthorized access |
+| `-2` | `ERR_FILE_NOT_FOUND` | File not found |
+| `-3` | `ERR_FILE_EXISTS` | File already exists |
+| `-4` | `ERR_FILE_UNAVAILABLE` | Storage server is offline |
+| `-5` | `ERR_NO_SS_AVAILABLE` | No Storage Server online |
+| `-6` | `ERR_INTERNAL` | System / socket / file I/O failure |
+| `-7` | `ERR_OUT_OF_RANGE` | Index out of range |
+| `-8` | `ERR_MAX_CLIENTS` | Max registered client limit reached |
+| `-9` | `ERR_MAX_FILES` | Naming Server registry full |
+| `-10` | `ERR_FILE_LOCKED` | Resource contention / locking (future) |
+| `-11` | `ERR_NETWORK` | Network failure |
+
+---
+
 ## Architecture
 
 ```
@@ -254,4 +295,13 @@ Command IDs defined in `common/protocols.h`.
 ├── client/
 │   └── main.c           ← CLI REPL
 └── Makefile
+
+---
+
+## Change History (Feature Log)
+
+### 2026-07-03
+- **Feature 3 (LIST Connected Users)**: Implemented `LIST` command in client REPL, querying Naming Server for the active registry of client names, IP addresses, and online statuses.
+- **Feature 5 (Universal Error Codes)**: Consolidated and standardized system-wide error definitions in `protocols.h`, mapping internal failure states to universal return codes.
+- **Code Refactor & Bug Fixes**: Removed unused variables (e.g. `storage_dir` context propagation to threads), cleaned block comments, and fixed a bug where `handle_ss_delete` in storage server failed to send an ACK packet back to the naming server.
 ```

@@ -1,27 +1,17 @@
 /*
  * client/main.c — Docs++ CLI Client (nfs_client)
  *
- * Usage:
- *   ./nfs_client <username>
+ * Usage: ./nfs_client <username>
  *
- * Interactive REPL — type commands after the prompt:
- *
- *   CREATE <filename>         Create a new empty file  [Feature 1]
- *   VIEW                      List your files          [Feature 4]
- *   VIEW -a                   List ALL files
- *   VIEW -l                   List your files (detailed)
- *   VIEW -al                  List all files (detailed)
- *   READ <filename>           Download and display a file's contents
- *   help                      Show help
- *   exit / quit               Exit
- *
- * Each command opens a fresh TCP connection to NM_PORT (5000),
- * following Y-K1n9's one-connection-per-command pattern.
- *
- * Compile (as part of Makefile target nfs_client):
- *   gcc -Wall -O2 -pthread \
- *       client/main.c common/utils.c \
- *       -o nfs_client
+ * Interactive REPL commands:
+ *   CREATE <filename>                Create a new empty file
+ *   VIEW [-a|-l|-al]                List files
+ *   READ <filename>                 Display a file's contents
+ *   STREAM <filename>               Word-by-word streaming
+ *   WRITE <filename> <sentence_num> Interactive word-level editing
+ *   DELETE <filename>               Delete a file (owner only)
+ *   LIST                            Show connected users
+ *   help / exit / quit
  */
 
 #include "../common/protocols.h"
@@ -34,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ─── ANSI colour codes ──────────────────────────────────────────────────── */
+/* --- ANSI colour codes ---------------------------------------------------- */
 #define CLR_RESET   "\033[0m"
 #define CLR_BOLD    "\033[1m"
 #define CLR_RED     "\033[31m"
@@ -48,14 +38,14 @@
 
 static const char *NM_IP = "127.0.0.1";
 
-/* ─── Pretty print helpers ───────────────────────────────────────────────── */
+/* --- Pretty print helpers ------------------------------------------------- */
 static void print_banner(const char *username) {
     printf("\n");
     printf(CLR_CYAN "╔══════════════════════════════════════════════╗\n" CLR_RESET);
     printf(CLR_CYAN "║  " CLR_BOLD CLR_WHITE "Docs++  Distributed File System Client" CLR_RESET CLR_CYAN "    ║\n" CLR_RESET);
     printf(CLR_CYAN "╚══════════════════════════════════════════════╝\n" CLR_RESET);
     printf(CLR_DIM  "  Logged in as: " CLR_RESET CLR_GREEN CLR_BOLD "%s" CLR_RESET "\n\n", username);
-    printf(CLR_DIM  "  Commands:  CREATE <file>  VIEW [-a|-l|-al]  READ <file>  STREAM <file>  DELETE <file>  help  exit\n" CLR_RESET);
+    printf(CLR_DIM  "  Type " CLR_RESET CLR_BOLD "help" CLR_RESET CLR_DIM " for a list of commands.\n" CLR_RESET);
     printf("\n");
 }
 
@@ -71,23 +61,18 @@ static void print_info(const char *msg) {
     printf(CLR_YELLOW "→ " CLR_RESET "%s\n", msg);
 }
 
-/* Format unix timestamp as "YYYY-MM-DD HH:MM" */
 static void fmt_time(int64_t ts, char *buf, size_t bufsz) {
     time_t t = (time_t)ts;
     struct tm *tm = localtime(&t);
     strftime(buf, bufsz, "%Y-%m-%d %H:%M", tm);
 }
 
-/* ─── Trim leading whitespace ─────────────────────────────────────────────── */
 static char *trim(char *s) {
     while (*s && isspace((unsigned char)*s)) s++;
     return s;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  CMD_CLIENT_REGISTER  (Y-K1n9 original)
- *  Handshake: identify ourselves to NM at startup.
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- CMD_CLIENT_REGISTER -------------------------------------------------- */
 static int register_client(const char *username) {
     int sockfd = connect_to_server(NM_IP, NM_PORT);
     if (sockfd < 0) {
@@ -120,9 +105,7 @@ static int register_client(const char *username) {
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  CMD_CLIENT_LOOKUP  (Y-K1n9 original)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- CMD_CLIENT_LOOKUP ---------------------------------------------------- */
 static int lookup_file(const char *username, const char *filename,
                         char *ss_ip, int *ss_port) {
     int sockfd = connect_to_server(NM_IP, NM_PORT);
@@ -158,9 +141,7 @@ static int lookup_file(const char *username, const char *filename,
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  READ command — lookup + read from SS directly  (Y-K1n9 flow)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- cmd_read ------------------------------------------------------------- */
 static void cmd_read(const char *username, const char *filename) {
     char ss_ip[MAX_IP_LEN] = {0};
     int  ss_port            = 0;
@@ -175,7 +156,6 @@ static void cmd_read(const char *username, const char *filename) {
         return;
     }
 
-    /* Send command type + filename */
     int32_t cmd = CMD_FILE_READ;
     char    fname_buf[MAX_FILENAME] = {0};
     strncpy(fname_buf, filename, MAX_FILENAME - 1);
@@ -183,7 +163,6 @@ static void cmd_read(const char *username, const char *filename) {
     send_all(ss_fd, &cmd,      sizeof(cmd));
     send_all(ss_fd, fname_buf, sizeof(fname_buf));
 
-    /* Receive header */
     ReadResponseHeader hdr;
     if (recv_struct(ss_fd, &hdr, sizeof(hdr)) < 0 || hdr.status != ERR_OK) {
         print_err("File not found on Storage Server.");
@@ -191,7 +170,6 @@ static void cmd_read(const char *username, const char *filename) {
         return;
     }
 
-    /* Receive content */
     if (hdr.content_length <= 0) {
         print_info("File is empty.");
         close(ss_fd);
@@ -204,13 +182,8 @@ static void cmd_read(const char *username, const char *filename) {
     int success = 0;
     while (1) {
         FileChunkPacket chunk;
-        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) {
-            break;
-        }
-        if (chunk.chunk_size == 0) {
-            success = 1;
-            break;
-        }
+        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) break;
+        if (chunk.chunk_size == 0) { success = 1; break; }
         fwrite(chunk.data, 1, (size_t)chunk.chunk_size, stdout);
         fflush(stdout);
     }
@@ -225,6 +198,7 @@ static void cmd_read(const char *username, const char *filename) {
     printf(CLR_CYAN "─────────────────────────────────────────────────\n" CLR_RESET);
 }
 
+/* --- cmd_stream ----------------------------------------------------------- */
 static void cmd_stream(const char *username, const char *filename) {
     if (!filename || filename[0] == '\0') {
         print_err("Usage: STREAM <filename>");
@@ -244,7 +218,6 @@ static void cmd_stream(const char *username, const char *filename) {
         return;
     }
 
-    /* Send command type + filename */
     int32_t cmd = CMD_FILE_READ;
     char    fname_buf[MAX_FILENAME] = {0};
     strncpy(fname_buf, filename, MAX_FILENAME - 1);
@@ -252,7 +225,6 @@ static void cmd_stream(const char *username, const char *filename) {
     send_all(ss_fd, &cmd,      sizeof(cmd));
     send_all(ss_fd, fname_buf, sizeof(fname_buf));
 
-    /* Receive header */
     ReadResponseHeader hdr;
     if (recv_struct(ss_fd, &hdr, sizeof(hdr)) < 0 || hdr.status != ERR_OK) {
         print_err("File not found on Storage Server.");
@@ -260,7 +232,6 @@ static void cmd_stream(const char *username, const char *filename) {
         return;
     }
 
-    /* Receive content */
     if (hdr.content_length <= 0) {
         print_info("File is empty.");
         close(ss_fd);
@@ -276,13 +247,8 @@ static void cmd_stream(const char *username, const char *filename) {
 
     while (1) {
         FileChunkPacket chunk;
-        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) {
-            break;
-        }
-        if (chunk.chunk_size == 0) {
-            success = 1;
-            break;
-        }
+        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) break;
+        if (chunk.chunk_size == 0) { success = 1; break; }
 
         for (int i = 0; i < chunk.chunk_size; i++) {
             char c = chunk.data[i];
@@ -291,7 +257,7 @@ static void cmd_stream(const char *username, const char *filename) {
                     word_buf[word_len] = '\0';
                     printf("%s", word_buf);
                     fflush(stdout);
-                    usleep(100000); // 0.1 seconds
+                    usleep(100000);
                     word_len = 0;
                 }
                 putchar(c);
@@ -319,6 +285,7 @@ static void cmd_stream(const char *username, const char *filename) {
     printf(CLR_CYAN "─────────────────────────────────────────────────\n" CLR_RESET);
 }
 
+/* --- cmd_delete ----------------------------------------------------------- */
 static void cmd_delete(const char *username, const char *filename) {
     if (!filename || filename[0] == '\0') {
         print_err("Usage: DELETE <filename>");
@@ -361,74 +328,73 @@ static void cmd_delete(const char *username, const char *filename) {
     }
 }
 
+/* --- cmd_write ------------------------------------------------------------ */
 static void cmd_write(const char *username, const char *filename, int sentence_number) {
     if (sentence_number < 0) {
         print_err("ERROR: Sentence index out of range.");
         return;
     }
-    
+
     char ss_ip[MAX_IP_LEN] = {0};
     int ss_port = 0;
-    
+
     printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
     if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
-    
+
     int ss_fd = connect_to_server(ss_ip, ss_port);
     if (ss_fd < 0) {
         print_err("Cannot connect to Storage Server.");
         return;
     }
-    
+
     WriteStartPacket start_pkt;
     memset(&start_pkt, 0, sizeof(start_pkt));
     start_pkt.command_type = CMD_WRITE;
     strncpy(start_pkt.filename, filename, MAX_FILENAME - 1);
     start_pkt.sentence_number = sentence_number;
-    
+
     if (send_struct(ss_fd, &start_pkt, sizeof(start_pkt)) < 0) {
         print_err("Failed to send WRITE request.");
         close(ss_fd);
         return;
     }
-    
+
     WriteStartResponse start_resp;
     if (recv_struct(ss_fd, &start_resp, sizeof(start_resp)) < 0) {
         print_err("No response from Storage Server.");
         close(ss_fd);
         return;
     }
-    
+
     if (start_resp.status != ERR_OK) {
         print_err(start_resp.message);
         close(ss_fd);
         return;
     }
-    
+
     char line[1024];
     while (1) {
         printf("Client: ");
         fflush(stdout);
-        
-        if (!fgets(line, sizeof(line), stdin)) {
-            break;
-        }
-        
+
+        if (!fgets(line, sizeof(line), stdin)) break;
+
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
-        
+
         char *trimmed = trim(line);
         if (trimmed[0] == '\0') continue;
-        
+
         WriteUpdatePacket update_pkt;
         memset(&update_pkt, 0, sizeof(update_pkt));
-        
+
         if (strcasecmp(trimmed, "ETIRW") == 0) {
             update_pkt.word_index = -1;
             if (send_struct(ss_fd, &update_pkt, sizeof(update_pkt)) < 0) {
                 print_err("Failed to send ETIRW commit.");
                 break;
             }
-            
+
             WriteUpdateResponse upd_resp;
             if (recv_struct(ss_fd, &upd_resp, sizeof(upd_resp)) < 0) {
                 print_err("Failed to receive commit acknowledgment.");
@@ -447,16 +413,16 @@ static void cmd_write(const char *username, const char *filename, int sentence_n
                 print_err("Invalid format. Usage: <word_index> <content> or ETIRW");
                 continue;
             }
-            
+
             update_pkt.word_index = (int32_t)val;
             char *content = trim(endptr);
             strncpy(update_pkt.content, content, MAX_MESSAGE - 1);
-            
+
             if (send_struct(ss_fd, &update_pkt, sizeof(update_pkt)) < 0) {
                 print_err("Failed to send update.");
                 break;
             }
-            
+
             WriteUpdateResponse upd_resp;
             if (recv_struct(ss_fd, &upd_resp, sizeof(upd_resp)) < 0) {
                 print_err("Failed to receive update acknowledgment.");
@@ -471,12 +437,7 @@ static void cmd_write(const char *username, const char *filename, int sentence_n
     close(ss_fd);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  CREATE command  [Feature 1 — NEW]
- *
- *  Client → NM: CreateRequestPacket
- *  NM → Client: CreateResponsePacket
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- cmd_create ----------------------------------------------------------- */
 static void cmd_create(const char *username, const char *filename) {
     if (!filename || filename[0] == '\0') {
         print_err("Usage: CREATE <filename>");
@@ -519,18 +480,7 @@ static void cmd_create(const char *username, const char *filename) {
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  VIEW command  [Feature 4 — NEW]
- *
- *  Client → NM: ViewRequestPacket (with flags)
- *  NM → Client: ViewResponseHeader + N × FileInfoEntry
- *
- *  Flags (without '-'):
- *    ""   or nothing → your files, names only
- *    "a"             → all files, names only
- *    "l"             → your files, detailed table
- *    "al"            → all files, detailed table
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- cmd_view ------------------------------------------------------------- */
 static void cmd_view(const char *username, const char *flags) {
     int sockfd = connect_to_server(NM_IP, NM_PORT);
     if (sockfd < 0) {
@@ -572,7 +522,6 @@ static void cmd_view(const char *username, const char *flags) {
     int show_long = (strchr(flags, 'l') != NULL);
     int show_all  = (strchr(flags, 'a') != NULL);
 
-    /* Table header */
     printf("\n");
     if (show_all)
         printf(CLR_BOLD CLR_WHITE "  All files on the system:\n" CLR_RESET);
@@ -601,7 +550,6 @@ static void cmd_view(const char *username, const char *flags) {
                "───────────────────────────", "───────────────");
     }
 
-    /* Receive and display each entry */
     for (int i = 0; i < hdr.file_count; ++i) {
         FileInfoEntry entry;
         if (recv_struct(sockfd, &entry, sizeof(entry)) < 0) {
@@ -614,7 +562,6 @@ static void cmd_view(const char *username, const char *flags) {
             fmt_time(entry.mtime, mtime_s, sizeof(mtime_s));
             fmt_time(entry.atime, atime_s, sizeof(atime_s));
 
-            /* Colour own files cyan, others white */
             const char *fc = strcmp(entry.owner, username) == 0
                              ? CLR_CYAN : CLR_WHITE;
 
@@ -639,7 +586,70 @@ static void cmd_view(const char *username, const char *flags) {
     close(sockfd);
 }
 
-/* ─── Help text ──────────────────────────────────────────────────────────── */
+/* --- cmd_list ------------------------------------------------------------- */
+static void cmd_list(void) {
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    ListRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_LIST;
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send LIST request.");
+        close(sockfd);
+        return;
+    }
+
+    ListResponseHeader hdr;
+    if (recv_struct(sockfd, &hdr, sizeof(hdr)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+
+    if (hdr.status != ERR_OK) {
+        print_err("Server returned an error.");
+        close(sockfd);
+        return;
+    }
+
+    if (hdr.user_count == 0) {
+        print_info("No users connected.");
+        close(sockfd);
+        return;
+    }
+
+    printf("\n");
+    printf(CLR_BOLD CLR_WHITE "  Connected Users:\n" CLR_RESET);
+    printf(CLR_DIM "  %-20s  %-16s  %-8s\n" CLR_RESET,
+           "Username", "IP Address", "Status");
+    printf(CLR_DIM "  %-20s  %-16s  %-8s\n" CLR_RESET,
+           "───────────────────", "───────────────", "────────");
+
+    for (int i = 0; i < hdr.user_count; ++i) {
+        UserInfoEntry entry;
+        if (recv_struct(sockfd, &entry, sizeof(entry)) < 0) {
+            print_err("Stream cut short.");
+            break;
+        }
+
+        const char *status_str = entry.is_online ? "online" : "offline";
+        const char *clr = entry.is_online ? CLR_GREEN : CLR_RED;
+
+        printf("  " CLR_BOLD CLR_CYAN "%-20s" CLR_RESET
+               "  %-16s  %s%-8s" CLR_RESET "\n",
+               entry.username, entry.ip, clr, status_str);
+    }
+
+    printf("\n" CLR_DIM "  %d user(s) total.\n\n" CLR_RESET, hdr.user_count);
+    close(sockfd);
+}
+
+/* --- Help text ------------------------------------------------------------ */
 static void print_help(void) {
     printf("\n" CLR_BOLD CLR_WHITE "  Docs++ Commands\n" CLR_RESET);
     printf(CLR_CYAN "  ────────────────────────────────────────────────────\n" CLR_RESET);
@@ -652,11 +662,12 @@ static void print_help(void) {
     printf("  " CLR_BOLD "STREAM" CLR_RESET " <filename>  Stream a file's contents word-by-word with delay\n");
     printf("  " CLR_BOLD "WRITE" CLR_RESET " <filename> <sentence_num>  Edit a file at word/sentence level\n");
     printf("  " CLR_BOLD "DELETE" CLR_RESET " <filename>  Delete a file from the NFS (owner only)\n");
+    printf("  " CLR_BOLD "LIST" CLR_RESET "               Show all connected users\n");
     printf("  " CLR_BOLD "exit" CLR_RESET " / " CLR_BOLD "quit" CLR_RESET "       Disconnect\n");
     printf(CLR_CYAN "  ────────────────────────────────────────────────────\n\n" CLR_RESET);
 }
 
-/* ─── REPL ───────────────────────────────────────────────────────────────── */
+/* --- REPL ----------------------------------------------------------------- */
 static void repl(const char *username) {
     char line[512];
     while (1) {
@@ -667,45 +678,49 @@ static void repl(const char *username) {
 
         if (!fgets(line, sizeof(line), stdin)) break;
 
-        /* Strip newline */
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
 
         char *cmd = trim(line);
         if (cmd[0] == '\0') continue;
 
-        /* ── exit / quit ── */
+        /* exit / quit */
         if (strcasecmp(cmd, "exit") == 0 ||
             strcasecmp(cmd, "quit") == 0) {
             printf(CLR_DIM "  Goodbye!\n" CLR_RESET);
             break;
         }
 
-        /* ── help ── */
+        /* help */
         if (strcasecmp(cmd, "help") == 0) {
             print_help();
             continue;
         }
 
-        /* ── CREATE <filename> ── */
+        /* LIST */
+        if (strcasecmp(cmd, "LIST") == 0) {
+            cmd_list();
+            continue;
+        }
+
+        /* CREATE <filename> */
         if (strncasecmp(cmd, "CREATE ", 7) == 0) {
             char *fname = trim(cmd + 7);
             cmd_create(username, fname);
             continue;
         }
 
-        /* ── WRITE <filename> <sentence_number> ── */
+        /* WRITE <filename> <sentence_number> */
         if (strncasecmp(cmd, "WRITE ", 6) == 0) {
             char *rest = trim(cmd + 6);
             char fname[MAX_FILENAME] = {0};
-            int sentence_num = -1;
-            
+
             char *space = strchr(rest, ' ');
             if (!space) {
                 print_err("Usage: WRITE <filename> <sentence_number>");
                 continue;
             }
-            
+
             *space = '\0';
             strncpy(fname, rest, MAX_FILENAME - 1);
             char *num_str = trim(space + 1);
@@ -713,43 +728,40 @@ static void repl(const char *username) {
                 print_err("Usage: WRITE <filename> <sentence_number>");
                 continue;
             }
-            
-            sentence_num = atoi(num_str);
+
+            int sentence_num = atoi(num_str);
             cmd_write(username, fname, sentence_num);
             continue;
         }
 
-        /* ── VIEW [flags] ── */
+        /* VIEW [flags] */
         if (strncasecmp(cmd, "VIEW", 4) == 0) {
             char flags[32] = {0};
             char *rest = trim(cmd + 4);
-            /* rest could be "", "-a", "-l", "-al", "-la" */
             if (rest[0] == '-') {
-                /* strip the leading '-' and any additional '-' */
                 char *f = rest + 1;
                 while (*f == '-') f++;
                 strncpy(flags, f, sizeof(flags) - 1);
-                /* normalise "la" → "al" doesn't matter, just copy */
             }
             cmd_view(username, flags);
             continue;
         }
 
-        /* ── READ <filename> ── */
+        /* READ <filename> */
         if (strncasecmp(cmd, "READ ", 5) == 0) {
             char *fname = trim(cmd + 5);
             cmd_read(username, fname);
             continue;
         }
 
-        /* ── STREAM <filename> ── */
+        /* STREAM <filename> */
         if (strncasecmp(cmd, "STREAM ", 7) == 0) {
             char *fname = trim(cmd + 7);
             cmd_stream(username, fname);
             continue;
         }
 
-        /* ── DELETE <filename> ── */
+        /* DELETE <filename> */
         if (strncasecmp(cmd, "DELETE ", 7) == 0) {
             char *fname = trim(cmd + 7);
             cmd_delete(username, fname);
@@ -761,7 +773,7 @@ static void repl(const char *username) {
     }
 }
 
-/* ─── Main ───────────────────────────────────────────────────────────────── */
+/* --- Main ----------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <username>\n", argv[0]);

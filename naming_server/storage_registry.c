@@ -3,15 +3,6 @@
  *
  * In-memory registry for the Name Server.
  * Tracks: Storage Servers, file→SS mapping (hash map), clients, file metadata.
- *
- * ── Preserved from Y-K1n9 ────────────────────────────────────────────────
- *   Hash-map with djb2 hash, REGISTRY_BUCKETS=256, FileMapNode chain.
- *   registry_register_ss, registry_add_file, registry_register_client,
- *   registry_find_ss_for_file, registry_pick_ss, registry_update_heartbeat.
- *
- * ── New additions ─────────────────────────────────────────────────────────
- *   FileMeta array, registry_create_file, registry_get_files,
- *   registry_user_has_access, registry_save_metadata, registry_load_metadata.
  */
 
 #include "storage_registry.h"
@@ -22,7 +13,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ─── Internal hash-map node (file → SS mapping) ─────────────────────────── */
+/* --- Internal hash-map node (file → SS mapping) --------------------------- */
 typedef struct FileMapNode {
     char           filename[MAX_FILENAME];
     StorageServer *servers[MAX_REPLICAS];
@@ -30,7 +21,7 @@ typedef struct FileMapNode {
     struct FileMapNode *next;
 } FileMapNode;
 
-/* ─── Global state ───────────────────────────────────────────────────────── */
+/* --- Global state --------------------------------------------------------- */
 static FileMapNode  *buckets[REGISTRY_BUCKETS];
 static StorageServer active_servers[MAX_STORAGE_SERVERS];
 static int32_t       active_server_count = 0;
@@ -38,13 +29,12 @@ static int32_t       active_server_count = 0;
 static ClientEntry   active_clients[MAX_CLIENTS];
 static int32_t       active_client_count = 0;
 
-/* File metadata array (new, for CREATE/VIEW) */
 static FileMeta      g_files[MAX_NM_FILES];
 static int32_t       g_file_count = 0;
 
 pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ─── djb2 hash (Y-K1n9 original) ───────────────────────────────────────── */
+/* --- djb2 hash ------------------------------------------------------------ */
 static unsigned long hash_file(const char *s) {
     unsigned long h = 5381;
     int c;
@@ -53,9 +43,19 @@ static unsigned long hash_file(const char *s) {
     return h;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Y-K1n9 original functions
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Internal: find file meta by name (caller must hold mutex) ------------ */
+static FileMeta *find_meta(const char *filename) {
+    for (int i = 0; i < g_file_count; ++i) {
+        if (g_files[i].active &&
+            strcmp(g_files[i].filename, filename) == 0)
+            return &g_files[i];
+    }
+    return NULL;
+}
+
+/* ==========================================================================
+ *  Core registry functions
+ * ========================================================================== */
 
 void registry_init(void) {
     pthread_mutex_lock(&registry_mutex);
@@ -94,7 +94,6 @@ StorageServer *registry_register_ss(const char *ip, int nm_port, int client_port
         }
     }
 
-    /* New SS */
     if (active_server_count >= MAX_STORAGE_SERVERS) {
         pthread_mutex_unlock(&registry_mutex);
         return NULL;
@@ -116,7 +115,6 @@ void registry_add_file(const char *filename, StorageServer *ss) {
     unsigned long h = hash_file(filename) % REGISTRY_BUCKETS;
     pthread_mutex_lock(&registry_mutex);
 
-    /* Check for existing entry and add replica */
     FileMapNode *node = buckets[h];
     while (node) {
         if (strcmp(node->filename, filename) == 0) {
@@ -128,7 +126,6 @@ void registry_add_file(const char *filename, StorageServer *ss) {
         node = node->next;
     }
 
-    /* New entry */
     FileMapNode *new_node = malloc(sizeof(FileMapNode));
     if (!new_node) { pthread_mutex_unlock(&registry_mutex); return; }
     memset(new_node, 0, sizeof(*new_node));
@@ -152,7 +149,7 @@ int registry_register_client(const char *username, const char *ip) {
     }
     if (active_client_count >= MAX_CLIENTS) {
         pthread_mutex_unlock(&registry_mutex);
-        return -1;
+        return ERR_MAX_CLIENTS;
     }
     ClientEntry *c = &active_clients[active_client_count++];
     strncpy(c->username, username, MAX_USERNAME - 1);
@@ -210,19 +207,9 @@ void registry_update_heartbeat(const char *ip, int port) {
     pthread_mutex_unlock(&registry_mutex);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  New additions — Feature 1 (CREATE) and Feature 4 (VIEW)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Internal helper: find file meta by name (caller must hold mutex) */
-static FileMeta *find_meta(const char *filename) {
-    for (int i = 0; i < g_file_count; ++i) {
-        if (g_files[i].active &&
-            strcmp(g_files[i].filename, filename) == 0)
-            return &g_files[i];
-    }
-    return NULL;
-}
+/* ==========================================================================
+ *  File metadata functions
+ * ========================================================================== */
 
 int registry_file_exists(const char *filename) {
     pthread_mutex_lock(&registry_mutex);
@@ -235,11 +222,11 @@ int registry_create_file(const char *filename, const char *owner, int ss_id) {
     pthread_mutex_lock(&registry_mutex);
     if (find_meta(filename)) {
         pthread_mutex_unlock(&registry_mutex);
-        return -1;   /* already exists */
+        return ERR_FILE_EXISTS;
     }
     if (g_file_count >= MAX_NM_FILES) {
         pthread_mutex_unlock(&registry_mutex);
-        return -1;   /* store full */
+        return ERR_MAX_FILES;
     }
     FileMeta *m = &g_files[g_file_count++];
     memset(m, 0, sizeof(*m));
@@ -253,7 +240,7 @@ int registry_create_file(const char *filename, const char *owner, int ss_id) {
     m->acl[0].level = 2;
     m->acl_count    = 1;
     pthread_mutex_unlock(&registry_mutex);
-    return 0;
+    return ERR_OK;
 }
 
 int registry_user_has_access(const char *filename, const char *username) {
@@ -308,7 +295,77 @@ void registry_update_file_stats(const char *filename,
     pthread_mutex_unlock(&registry_mutex);
 }
 
-/* ─── Persistence ────────────────────────────────────────────────────────── */
+const char *registry_get_file_owner(const char *filename) {
+    pthread_mutex_lock(&registry_mutex);
+    FileMeta *m = find_meta(filename);
+    const char *owner = m ? m->owner : NULL;
+    pthread_mutex_unlock(&registry_mutex);
+    return owner;
+}
+
+int registry_delete_file(const char *filename, StorageServer *out_servers[], int *out_server_count) {
+    if (!filename) return ERR_FILE_NOT_FOUND;
+    unsigned long h = hash_file(filename) % REGISTRY_BUCKETS;
+    pthread_mutex_lock(&registry_mutex);
+
+    /* Remove from hash-map */
+    FileMapNode *prev = NULL;
+    FileMapNode *curr = buckets[h];
+    int found_in_map = 0;
+    *out_server_count = 0;
+
+    while (curr) {
+        if (strcmp(curr->filename, filename) == 0) {
+            found_in_map = 1;
+            *out_server_count = curr->server_count;
+            for (int i = 0; i < curr->server_count; ++i) {
+                out_servers[i] = curr->servers[i];
+            }
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                buckets[h] = curr->next;
+            }
+            free(curr);
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    /* Deactivate in metadata */
+    FileMeta *m = find_meta(filename);
+    if (m) {
+        m->active = 0;
+    }
+
+    pthread_mutex_unlock(&registry_mutex);
+
+    if (found_in_map || m) {
+        registry_save_metadata();
+        return ERR_OK;
+    }
+    return ERR_FILE_NOT_FOUND;
+}
+
+/* ==========================================================================
+ *  Client query
+ * ========================================================================== */
+
+int registry_get_clients(ClientEntry *out, int max_count) {
+    pthread_mutex_lock(&registry_mutex);
+    int count = 0;
+    for (int i = 0; i < active_client_count && count < max_count; ++i) {
+        out[count++] = active_clients[i];
+    }
+    pthread_mutex_unlock(&registry_mutex);
+    return count;
+}
+
+/* ==========================================================================
+ *  Persistence
+ * ========================================================================== */
+
 void registry_save_metadata(void) {
     FILE *f = fopen("nm_files.json", "w");
     if (!f) return;
@@ -377,59 +434,4 @@ void registry_load_metadata(void) {
     fclose(f);
     printf("[NM Registry] Loaded %d file(s) from persistent metadata.\n",
            g_file_count);
-}
-
-const char *registry_get_file_owner(const char *filename) {
-    pthread_mutex_lock(&registry_mutex);
-    FileMeta *m = find_meta(filename);
-    const char *owner = m ? m->owner : NULL;
-    pthread_mutex_unlock(&registry_mutex);
-    return owner;
-}
-
-int registry_delete_file(const char *filename, StorageServer *out_servers[], int *out_server_count) {
-    if (!filename) return -1;
-    unsigned long h = hash_file(filename) % REGISTRY_BUCKETS;
-    pthread_mutex_lock(&registry_mutex);
-
-    /* 1. Find and remove from hash-map */
-    FileMapNode *prev = NULL;
-    FileMapNode *curr = buckets[h];
-    int found_in_map = 0;
-    *out_server_count = 0;
-
-    while (curr) {
-        if (strcmp(curr->filename, filename) == 0) {
-            found_in_map = 1;
-            /* Copy the servers to output array */
-            *out_server_count = curr->server_count;
-            for (int i = 0; i < curr->server_count; ++i) {
-                out_servers[i] = curr->servers[i];
-            }
-            /* Remove from linked list */
-            if (prev) {
-                prev->next = curr->next;
-            } else {
-                buckets[h] = curr->next;
-            }
-            free(curr);
-            break;
-        }
-        prev = curr;
-        curr = curr->next;
-    }
-
-    /* 2. Find and deactivate in metadata */
-    FileMeta *m = find_meta(filename);
-    if (m) {
-        m->active = 0;
-    }
-
-    pthread_mutex_unlock(&registry_mutex);
-
-    if (found_in_map || m) {
-        registry_save_metadata();
-        return 0; /* success */
-    }
-    return -1; /* file not found */
 }

@@ -1,22 +1,8 @@
 /*
  * naming_server/main.c — Docs++ Name Server (nm_server)
  *
- * Listens on NM_PORT (5000) for connections from both Storage Servers
- * and Clients. Each connection is handled in its own thread.
- *
- * Dispatches on the first int32_t (command type):
- *
- *   CMD_REGISTER_SS        → register a Storage Server
- *   CMD_CLIENT_REGISTER    → register a Client username
- *   CMD_CLIENT_LOOKUP      → look up which SS holds a file
- *   CMD_HEARTBEAT          → SS heartbeat (on NM_HEARTBEAT_PORT 5001)
- *   CMD_CREATE  [NEW]      → create a new file (routed to SS)
- *   CMD_VIEW    [NEW]      → list files with optional flags
- *
- * Compile (as part of Makefile target nm_server):
- *   gcc -Wall -O2 -pthread \
- *       naming_server/main.c naming_server/storage_registry.c common/utils.c \
- *       -o nm_server
+ * Listens on NM_PORT (5000) for SS and Client connections.
+ * Dispatches on the first int32_t (command type).
  */
 
 #include "storage_registry.h"
@@ -35,7 +21,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* ─── Logging helpers ────────────────────────────────────────────────────── */
+/* --- Logging -------------------------------------------------------------- */
 static void nm_log(const char *fmt, ...) {
     time_t now = time(NULL);
     char ts[32];
@@ -50,15 +36,13 @@ static void nm_log(const char *fmt, ...) {
     fflush(stdout);
 }
 
-/* ─── Per-connection argument ────────────────────────────────────────────── */
+/* --- Per-connection argument ---------------------------------------------- */
 typedef struct {
     int              client_fd;
     struct sockaddr_in addr;
 } Connection;
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Handler: CMD_REGISTER_SS  (Y-K1n9 original)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_REGISTER_SS --------------------------------------------- */
 static void handle_register_ss(int fd, int32_t cmd_type,
                                  const char *peer_ip) {
     SS_Registration_Packet packet;
@@ -76,7 +60,6 @@ static void handle_register_ss(int fd, int32_t cmd_type,
     if (ss) {
         for (int i = 0; i < packet.file_count; ++i) {
             registry_add_file(packet.filenames[i], ss);
-            /* Also add to metadata store if not already there */
             if (!registry_file_exists(packet.filenames[i])) {
                 registry_create_file(packet.filenames[i], "unknown", ss->id);
             }
@@ -90,9 +73,7 @@ static void handle_register_ss(int fd, int32_t cmd_type,
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Handler: CMD_CLIENT_REGISTER  (Y-K1n9 original)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_CLIENT_REGISTER ----------------------------------------- */
 static void handle_client_register(int fd, int32_t cmd_type,
                                      const char *peer_ip) {
     ClientRegisterPacket packet;
@@ -119,9 +100,7 @@ static void handle_client_register(int fd, int32_t cmd_type,
     send_struct(fd, &resp, sizeof(resp));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Handler: CMD_CLIENT_LOOKUP  (Y-K1n9 original)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_CLIENT_LOOKUP ------------------------------------------- */
 static void handle_client_lookup(int fd, int32_t cmd_type,
                                    const char *peer_ip) {
     ClientLookupPacket packet;
@@ -148,14 +127,16 @@ static void handle_client_lookup(int fd, int32_t cmd_type,
         resp.status = ERR_NO_PERMISSION;
         snprintf(resp.message, sizeof(resp.message),
                  "ERROR: Permission denied for file '%s'.", packet.filename);
-        nm_log("Lookup: permission denied for user '%s' on file '%s'.", packet.username, packet.filename);
+        nm_log("Lookup: permission denied for user '%s' on file '%s'.",
+               packet.username, packet.filename);
     } else {
         StorageServer *ss = registry_find_ss_for_file(packet.filename);
         if (!ss) {
             resp.status = ERR_FILE_UNAVAILABLE;
             snprintf(resp.message, sizeof(resp.message),
-                     "ERROR: Storage Server hosting '%s' is offline.", packet.filename);
-            nm_log("Lookup: Storage Server hosting '%s' is offline.", packet.filename);
+                     "ERROR: Storage Server hosting '%s' is offline.",
+                     packet.filename);
+            nm_log("Lookup: SS hosting '%s' is offline.", packet.filename);
         } else {
             resp.status  = ERR_OK;
             resp.ss_port = ss->client_port;
@@ -170,14 +151,7 @@ static void handle_client_lookup(int fd, int32_t cmd_type,
     send_struct(fd, &resp, sizeof(resp));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Handler: CMD_CREATE  [NEW — Feature 1]
- *
- *  Flow:  Client → NM (CreateRequestPacket)
- *         NM → SS  (SSCreatePacket via fresh TCP connection to ss.client_port)
- *         SS → NM  (SSCreateAck)
- *         NM → Client (CreateResponsePacket)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_CREATE -------------------------------------------------- */
 static void handle_create(int fd, int32_t cmd_type,
                             const char *peer_ip) {
     CreateRequestPacket req;
@@ -195,7 +169,6 @@ static void handle_create(int fd, int32_t cmd_type,
     CreateResponsePacket resp;
     memset(&resp, 0, sizeof(resp));
 
-    /* 1. Check for duplicate */
     if (registry_file_exists(req.filename)) {
         resp.status = ERR_FILE_EXISTS;
         snprintf(resp.message, sizeof(resp.message),
@@ -205,7 +178,6 @@ static void handle_create(int fd, int32_t cmd_type,
         return;
     }
 
-    /* 2. Pick an available SS */
     StorageServer *ss = registry_pick_ss();
     if (!ss) {
         resp.status = ERR_NO_SS_AVAILABLE;
@@ -216,7 +188,6 @@ static void handle_create(int fd, int32_t cmd_type,
         return;
     }
 
-    /* 3. Forward CREATE to SS */
     int ss_fd = connect_to_server(ss->ip, ss->client_port);
     if (ss_fd < 0) {
         resp.status = ERR_NO_SS_AVAILABLE;
@@ -267,7 +238,6 @@ static void handle_create(int fd, int32_t cmd_type,
         return;
     }
 
-    /* 4. Register in NM metadata and hash-map */
     registry_create_file(req.filename, req.username, ss->id);
     registry_add_file(req.filename, ss);
     registry_save_metadata();
@@ -281,18 +251,7 @@ static void handle_create(int fd, int32_t cmd_type,
     send_struct(fd, &resp, sizeof(resp));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Handler: CMD_VIEW  [NEW — Feature 4]
- *
- *  Flags (stored without the '-'):
- *    ""   → files the user has access to (names only)
- *    "a"  → all files on the system (names only)
- *    "l"  → user's files with details
- *    "al" → all files with details
- *
- *  Flow: Client → NM (ViewRequestPacket)
- *        NM → Client (ViewResponseHeader + N × FileInfoEntry)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_VIEW ---------------------------------------------------- */
 static void handle_view(int fd, int32_t cmd_type,
                           const char *peer_ip) {
     ViewRequestPacket req;
@@ -308,8 +267,6 @@ static void handle_view(int fd, int32_t cmd_type,
     nm_log("VIEW request: flags='%s' user='%s' show_all=%d from %s",
            req.flags, req.username, show_all, peer_ip);
 
-    /* Collect matching files — heap-allocated to avoid static-buffer race
-     * condition since handle_view is called from multiple threads. */
     FileMeta *meta_buf = malloc(sizeof(FileMeta) * MAX_VIEW_FILES);
     if (!meta_buf) {
         ViewResponseHeader hdr_err;
@@ -321,13 +278,11 @@ static void handle_view(int fd, int32_t cmd_type,
     int count = registry_get_files(req.username, show_all,
                                     meta_buf, MAX_VIEW_FILES);
 
-    /* Send header */
     ViewResponseHeader hdr;
     hdr.status     = ERR_OK;
     hdr.file_count = count;
     send_struct(fd, &hdr, sizeof(hdr));
 
-    /* Send each FileInfoEntry */
     for (int i = 0; i < count; ++i) {
         FileInfoEntry entry;
         memset(&entry, 0, sizeof(entry));
@@ -348,9 +303,7 @@ static void handle_view(int fd, int32_t cmd_type,
     free(meta_buf);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Handler: CMD_DELETE
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_DELETE -------------------------------------------------- */
 static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
     DeleteRequestPacket req;
     req.command_type = cmd_type;
@@ -367,7 +320,6 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
     DeleteResponsePacket resp;
     memset(&resp, 0, sizeof(resp));
 
-    /* 1. Check if file exists */
     if (!registry_file_exists(req.filename)) {
         resp.status = ERR_FILE_NOT_FOUND;
         snprintf(resp.message, sizeof(resp.message),
@@ -377,19 +329,18 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
         return;
     }
 
-    /* 2. Check ownership authorization (only owner can delete) */
     const char *owner = registry_get_file_owner(req.filename);
     if (!owner || strcmp(owner, req.username) != 0) {
         resp.status = ERR_NO_PERMISSION;
         snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Permission denied. Only the owner '%s' can delete this file.", owner ? owner : "unknown");
+                 "ERROR: Permission denied. Only the owner '%s' can delete this file.",
+                 owner ? owner : "unknown");
         nm_log("DELETE denied: user '%s' is not owner of '%s' (owner is '%s')",
                req.username, req.filename, owner ? owner : "unknown");
         send_struct(fd, &resp, sizeof(resp));
         return;
     }
 
-    /* 3. Delete from registry tracking map and metadata */
     StorageServer *servers[MAX_REPLICAS];
     int server_count = 0;
     memset(servers, 0, sizeof(servers));
@@ -403,7 +354,6 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
         return;
     }
 
-    /* 4. Cascade eviction to all copies (replicas) */
     int deleted_count = 0;
     int failed_count = 0;
 
@@ -411,7 +361,7 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
         if (!servers[i]) continue;
 
         if (servers[i]->status != SS_STATUS_ONLINE) {
-            nm_log("DELETE replication: SS[%d] %s:%d is offline. Skipping physical wipe.",
+            nm_log("DELETE: SS[%d] %s:%d is offline, skipping.",
                    servers[i]->id, servers[i]->ip, servers[i]->client_port);
             failed_count++;
             continue;
@@ -419,7 +369,7 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
 
         int ss_fd = connect_to_server(servers[i]->ip, servers[i]->client_port);
         if (ss_fd < 0) {
-            nm_log("DELETE replication: cannot connect to SS[%d] at %s:%d",
+            nm_log("DELETE: cannot connect to SS[%d] at %s:%d",
                    servers[i]->id, servers[i]->ip, servers[i]->client_port);
             failed_count++;
             continue;
@@ -431,7 +381,7 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
         strncpy(ss_req.filename, req.filename, MAX_FILENAME - 1);
 
         if (send_struct(ss_fd, &ss_req, sizeof(ss_req)) != 0) {
-            nm_log("DELETE replication: failed to send delete to SS[%d]", servers[i]->id);
+            nm_log("DELETE: failed to send delete to SS[%d]", servers[i]->id);
             close(ss_fd);
             failed_count++;
             continue;
@@ -440,7 +390,7 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
         SSDeleteAck ack;
         memset(&ack, 0, sizeof(ack));
         if (recv_struct(ss_fd, &ack, sizeof(ack)) != 0 || ack.status != ERR_OK) {
-            nm_log("DELETE replication: failed ACK or error from SS[%d]", servers[i]->id);
+            nm_log("DELETE: failed ACK or error from SS[%d]", servers[i]->id);
             failed_count++;
         } else {
             deleted_count++;
@@ -448,7 +398,7 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
         close(ss_fd);
     }
 
-    nm_log("DELETE OK: '%s' removed from tracking. Physically wiped from %d/%d servers.",
+    nm_log("DELETE OK: '%s' removed. Wiped from %d/%d servers.",
            req.filename, deleted_count, server_count);
 
     resp.status = ERR_OK;
@@ -463,6 +413,7 @@ static void handle_delete(int fd, int32_t cmd_type, const char *peer_ip) {
     send_struct(fd, &resp, sizeof(resp));
 }
 
+/* --- Handler: CMD_SS_UPDATE_STATS ----------------------------------------- */
 static void handle_update_stats(int fd, int32_t cmd_type, const char *peer_ip) {
     SSUpdateStatsPacket packet;
     packet.command_type = cmd_type;
@@ -474,15 +425,39 @@ static void handle_update_stats(int fd, int32_t cmd_type, const char *peer_ip) {
     }
 
     nm_log("UPDATE_STATS: file='%s' words=%d chars=%d size=%lld from %s",
-           packet.filename, packet.word_count, packet.char_count, (long long)packet.size_bytes, peer_ip);
+           packet.filename, packet.word_count, packet.char_count,
+           (long long)packet.size_bytes, peer_ip);
 
-    registry_update_file_stats(packet.filename, packet.word_count, packet.char_count, packet.size_bytes);
+    registry_update_file_stats(packet.filename, packet.word_count,
+                               packet.char_count, packet.size_bytes);
     registry_save_metadata();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  Main connection dispatcher
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* --- Handler: CMD_LIST ---------------------------------------------------- */
+static void handle_list(int fd, const char *peer_ip) {
+    nm_log("LIST request from %s", peer_ip);
+
+    ClientEntry clients[MAX_CLIENTS];
+    int count = registry_get_clients(clients, MAX_CLIENTS);
+
+    ListResponseHeader hdr;
+    hdr.status     = ERR_OK;
+    hdr.user_count = count;
+    send_struct(fd, &hdr, sizeof(hdr));
+
+    for (int i = 0; i < count; ++i) {
+        UserInfoEntry entry;
+        memset(&entry, 0, sizeof(entry));
+        strncpy(entry.username, clients[i].username, MAX_USERNAME - 1);
+        strncpy(entry.ip,       clients[i].ip,       MAX_IP_LEN  - 1);
+        entry.is_online = clients[i].status;
+        send_struct(fd, &entry, sizeof(entry));
+    }
+
+    nm_log("LIST OK: returned %d user(s).", count);
+}
+
+/* --- Main connection dispatcher ------------------------------------------- */
 static void *handle_connection(void *arg) {
     Connection *conn = (Connection *)arg;
     int fd           = conn->client_fd;
@@ -518,6 +493,9 @@ static void *handle_connection(void *arg) {
         case CMD_SS_UPDATE_STATS:
             handle_update_stats(fd, cmd_type, peer_ip);
             break;
+        case CMD_LIST:
+            handle_list(fd, peer_ip);
+            break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);
             break;
@@ -527,7 +505,7 @@ static void *handle_connection(void *arg) {
     return NULL;
 }
 
-/* ─── Heartbeat listener (port 5001) ─────────────────────────────────────── */
+/* --- Heartbeat listener (port 5001) --------------------------------------- */
 static void *heartbeat_listener(void *arg) {
     (void)arg;
     int hb_sock = create_server_socket(NM_HEARTBEAT_PORT);
@@ -553,7 +531,7 @@ static void *heartbeat_listener(void *arg) {
     return NULL;
 }
 
-/* ─── Main ───────────────────────────────────────────────────────────────── */
+/* --- Main ----------------------------------------------------------------- */
 int main(void) {
     registry_init();
     registry_load_metadata();
@@ -564,7 +542,6 @@ int main(void) {
         return 1;
     }
 
-    /* Start heartbeat listener in background */
     pthread_t hb_tid;
     pthread_create(&hb_tid, NULL, heartbeat_listener, NULL);
     pthread_detach(hb_tid);
