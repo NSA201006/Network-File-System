@@ -747,6 +747,13 @@ static void repl(const char *username) {
             continue;
         }
 
+        /* INFO <filename> */
+        if (strncasecmp(cmd, "INFO ", 5) == 0) {
+            char *fname = trim(cmd + 5);
+            cmd_info(username, fname);
+            continue;
+        }
+
         /* READ <filename> */
         if (strncasecmp(cmd, "READ ", 5) == 0) {
             char *fname = trim(cmd + 5);

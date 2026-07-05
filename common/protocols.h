@@ -72,7 +72,11 @@ typedef enum {
 
     /* LIST */
     CMD_LIST                 = 25,  /* Client → NM   */
-    CMD_LIST_RESP            = 26   /* NM     → Client */
+    CMD_LIST_RESP            = 26,  /* NM     → Client */
+
+    /* INFO */
+    CMD_INFO                 = 27,  /* Client → NM   */
+    CMD_INFO_RESP            = 28   /* NM     → Client */
 } CommandType;
 
 /* ==========================================================================
@@ -287,5 +291,30 @@ typedef struct {
     char    ip[MAX_IP_LEN];
     int32_t is_online;
 } UserInfoEntry;
+
+/* ==========================================================================
+ *  Packet structs — INFO
+ * ========================================================================== */
+
+/* Client → NM */
+typedef struct {
+    int32_t command_type;                      /* CMD_INFO */
+    char    username[MAX_USERNAME];
+    char    filename[MAX_FILENAME];
+} InfoRequestPacket;
+
+/* NM → Client */
+typedef struct {
+    int32_t status;
+    char    message[MAX_MESSAGE];
+    int64_t size_bytes;
+    int32_t word_count;
+    int32_t char_count;
+    int64_t created;
+    int64_t mtime;
+    int64_t atime;
+    char    owner[MAX_USERNAME];
+    int32_t access_level;
+} InfoResponsePacket;
 
 #endif /* PROTOCOLS_H */

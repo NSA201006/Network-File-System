@@ -457,6 +457,55 @@ static void handle_list(int fd, const char *peer_ip) {
     nm_log("LIST OK: returned %d user(s).", count);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  CMD_INFO handler (Feature 2)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void handle_info(int fd, int32_t cmd_type, const char *peer_ip) {
+    InfoRequestPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd, ((char *)&req) + sizeof(int32_t),
+                    sizeof(req) - sizeof(int32_t)) != 0) {
+        nm_log("Failed to read InfoRequestPacket from %s.", peer_ip);
+        return;
+    }
+
+    nm_log("INFO request: file='%s' user='%s' from %s",
+           req.filename, req.username, peer_ip);
+
+    InfoResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+
+    FileMeta meta;
+    if (registry_get_file_info(req.filename, &meta) < 0) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "File '%s' not found.", req.filename);
+        nm_log("INFO FAIL: '%s' not found.", req.filename);
+    } else {
+        int level = registry_user_has_access(req.filename, req.username);
+        if (level == 0) {
+            resp.status = ERR_NO_PERMISSION;
+            snprintf(resp.message, sizeof(resp.message),
+                     "Permission denied for '%s'.", req.filename);
+            nm_log("INFO FAIL: user '%s' lacks permission for '%s'.",
+                   req.username, req.filename);
+        } else {
+            resp.status       = ERR_OK;
+            resp.size_bytes   = meta.size_bytes;
+            resp.word_count   = meta.word_count;
+            resp.char_count   = meta.char_count;
+            resp.created      = meta.created;
+            resp.mtime        = meta.mtime;
+            resp.atime        = meta.atime;
+            strncpy(resp.owner, meta.owner, MAX_USERNAME - 1);
+            resp.access_level = level;
+            snprintf(resp.message, sizeof(resp.message), "Success.");
+            nm_log("INFO OK: returning metadata for '%s'.", req.filename);
+        }
+    }
+    send_struct(fd, &resp, sizeof(resp));
+}
+
 /* --- Main connection dispatcher ------------------------------------------- */
 static void *handle_connection(void *arg) {
     Connection *conn = (Connection *)arg;
@@ -495,6 +544,9 @@ static void *handle_connection(void *arg) {
             break;
         case CMD_LIST:
             handle_list(fd, peer_ip);
+            break;
+        case CMD_INFO:
+            handle_info(fd, cmd_type, peer_ip);
             break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);

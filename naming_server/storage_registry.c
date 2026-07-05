@@ -258,6 +258,18 @@ int registry_user_has_access(const char *filename, const char *username) {
     return 0;
 }
 
+int registry_get_file_info(const char *filename, FileMeta *out) {
+    pthread_mutex_lock(&registry_mutex);
+    FileMeta *m = find_meta(filename);
+    if (!m) {
+        pthread_mutex_unlock(&registry_mutex);
+        return -1;
+    }
+    *out = *m;
+    pthread_mutex_unlock(&registry_mutex);
+    return 0;
+}
+
 int registry_get_files(const char *username, int show_all,
                         FileMeta *out, int max_count) {
     pthread_mutex_lock(&registry_mutex);

@@ -83,7 +83,13 @@ void           registry_update_heartbeat(const char *ip, int port);
 /* --- File metadata API ---------------------------------------------------- */
 int            registry_file_exists(const char *filename);
 int            registry_create_file(const char *filename, const char *owner, int ss_id);
+/* Returns the access level (0=none,1=read,2=write) for <username> on <filename> */
 int            registry_user_has_access(const char *filename, const char *username);
+
+/* Retrieves the full FileMeta record for a file. Returns 0 if found, -1 if not. */
+int            registry_get_file_info(const char *filename, FileMeta *out);
+
+/* Populate <out> with up to <max_count> FileMeta entries. */
 int            registry_get_files(const char *username, int show_all,
                                    FileMeta *out, int max_count);
 void           registry_update_file_stats(const char *filename,
