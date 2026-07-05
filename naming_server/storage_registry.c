@@ -258,6 +258,81 @@ int registry_user_has_access(const char *filename, const char *username) {
     return 0;
 }
 
+int registry_grant_access(const char *filename, const char *requester, const char *target_user, int level) {
+    if (!filename || !requester || !target_user) return ERR_INTERNAL;
+    pthread_mutex_lock(&registry_mutex);
+    FileMeta *m = find_meta(filename);
+    if (!m) {
+        pthread_mutex_unlock(&registry_mutex);
+        return ERR_FILE_NOT_FOUND;
+    }
+    if (strcmp(m->owner, requester) != 0) {
+        pthread_mutex_unlock(&registry_mutex);
+        return ERR_NO_PERMISSION;
+    }
+
+    int found = 0;
+    for (int i = 0; i < m->acl_count; ++i) {
+        if (strcmp(m->acl[i].username, target_user) == 0) {
+            m->acl[i].level = level;
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        if (m->acl_count >= MAX_ACL_ENTRIES) {
+            pthread_mutex_unlock(&registry_mutex);
+            return ERR_INTERNAL;
+        }
+        strncpy(m->acl[m->acl_count].username, target_user, MAX_USERNAME - 1);
+        m->acl[m->acl_count].level = level;
+        m->acl_count++;
+    }
+
+    pthread_mutex_unlock(&registry_mutex);
+    registry_save_metadata();
+    return ERR_OK;
+}
+
+int registry_remove_access(const char *filename, const char *requester, const char *target_user) {
+    if (!filename || !requester || !target_user) return ERR_INTERNAL;
+    pthread_mutex_lock(&registry_mutex);
+    FileMeta *m = find_meta(filename);
+    if (!m) {
+        pthread_mutex_unlock(&registry_mutex);
+        return ERR_FILE_NOT_FOUND;
+    }
+    if (strcmp(m->owner, requester) != 0) {
+        pthread_mutex_unlock(&registry_mutex);
+        return ERR_NO_PERMISSION;
+    }
+    if (strcmp(m->owner, target_user) == 0) {
+        /* Cannot remove owner access */
+        pthread_mutex_unlock(&registry_mutex);
+        return ERR_NO_PERMISSION;
+    }
+
+    int found_idx = -1;
+    for (int i = 0; i < m->acl_count; ++i) {
+        if (strcmp(m->acl[i].username, target_user) == 0) {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx >= 0) {
+        for (int i = found_idx; i < m->acl_count - 1; ++i) {
+            m->acl[i] = m->acl[i + 1];
+        }
+        m->acl_count--;
+    }
+
+    pthread_mutex_unlock(&registry_mutex);
+    registry_save_metadata();
+    return ERR_OK;
+}
+
 int registry_get_file_info(const char *filename, FileMeta *out) {
     pthread_mutex_lock(&registry_mutex);
     FileMeta *m = find_meta(filename);

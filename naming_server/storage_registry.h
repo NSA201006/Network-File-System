@@ -85,6 +85,8 @@ int            registry_file_exists(const char *filename);
 int            registry_create_file(const char *filename, const char *owner, int ss_id);
 /* Returns the access level (0=none,1=read,2=write) for <username> on <filename> */
 int            registry_user_has_access(const char *filename, const char *username);
+int            registry_grant_access(const char *filename, const char *requester, const char *target_user, int level);
+int            registry_remove_access(const char *filename, const char *requester, const char *target_user);
 
 /* Retrieves the full FileMeta record for a file. Returns 0 if found, -1 if not. */
 int            registry_get_file_info(const char *filename, FileMeta *out);

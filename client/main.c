@@ -586,6 +586,64 @@ static void cmd_view(const char *username, const char *flags) {
     close(sockfd);
 }
 
+/* --- cmd_info ------------------------------------------------------------- */
+static void cmd_info(const char *username, const char *filename) {
+    if (!filename || filename[0] == '\0') {
+        print_err("Usage: INFO <filename>");
+        return;
+    }
+
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    InfoRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_INFO;
+    strncpy(req.username, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send INFO request.");
+        close(sockfd);
+        return;
+    }
+
+    InfoResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+    close(sockfd);
+
+    if (resp.status != ERR_OK) {
+        print_err(resp.message);
+        return;
+    }
+
+    char created_s[24], mtime_s[24], atime_s[24];
+    fmt_time(resp.created, created_s, sizeof(created_s));
+    fmt_time(resp.mtime, mtime_s, sizeof(mtime_s));
+    fmt_time(resp.atime, atime_s, sizeof(atime_s));
+
+    const char *acc_str = (resp.access_level == 2) ? "RW" : (resp.access_level == 1) ? "R" : "None";
+
+    printf("\n" CLR_CYAN "─── %s ───────────────────────────────────\n" CLR_RESET, filename);
+    printf("  Owner:          " CLR_BOLD "%s" CLR_RESET "\n", resp.owner);
+    printf("  Size:           %lld bytes\n", (long long)resp.size_bytes);
+    printf("  Words:          %d\n", resp.word_count);
+    printf("  Characters:     %d\n", resp.char_count);
+    printf("  Created:        %s\n", created_s);
+    printf("  Last Modified:  %s\n", mtime_s);
+    printf("  Last Accessed:  %s\n", atime_s);
+    printf("  Your Access:    %s\n", acc_str);
+    printf(CLR_CYAN "─────────────────────────────────────────────────\n" CLR_RESET);
+}
+
 /* --- cmd_list ------------------------------------------------------------- */
 static void cmd_list(void) {
     int sockfd = connect_to_server(NM_IP, NM_PORT);
@@ -649,6 +707,89 @@ static void cmd_list(void) {
     close(sockfd);
 }
 
+/* --- cmd_addaccess -------------------------------------------------------- */
+static void cmd_addaccess(const char *username, const char *flags, const char *filename, const char *target_user) {
+    int level = 0;
+    if (strcasecmp(flags, "-R") == 0) level = 1;
+    else if (strcasecmp(flags, "-W") == 0) level = 2;
+    else {
+        print_err("Invalid flag. Use -R for read, -W for read/write.");
+        return;
+    }
+
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    AccessRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_ADDACCESS;
+    strncpy(req.requester, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+    strncpy(req.target_user, target_user, MAX_USERNAME - 1);
+    req.level = level;
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send ADDACCESS request.");
+        close(sockfd);
+        return;
+    }
+
+    AccessResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+    close(sockfd);
+
+    if (resp.status == ERR_OK) {
+        print_ok(resp.message);
+    } else {
+        print_err(resp.message);
+    }
+}
+
+/* --- cmd_remaccess -------------------------------------------------------- */
+static void cmd_remaccess(const char *username, const char *filename, const char *target_user) {
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    AccessRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_REMACCESS;
+    strncpy(req.requester, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+    strncpy(req.target_user, target_user, MAX_USERNAME - 1);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send REMACCESS request.");
+        close(sockfd);
+        return;
+    }
+
+    AccessResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+    close(sockfd);
+
+    if (resp.status == ERR_OK) {
+        print_ok(resp.message);
+    } else {
+        print_err(resp.message);
+    }
+}
+
 /* --- Help text ------------------------------------------------------------ */
 static void print_help(void) {
     printf("\n" CLR_BOLD CLR_WHITE "  Docs++ Commands\n" CLR_RESET);
@@ -663,6 +804,8 @@ static void print_help(void) {
     printf("  " CLR_BOLD "WRITE" CLR_RESET " <filename> <sentence_num>  Edit a file at word/sentence level\n");
     printf("  " CLR_BOLD "DELETE" CLR_RESET " <filename>  Delete a file from the NFS (owner only)\n");
     printf("  " CLR_BOLD "LIST" CLR_RESET "               Show all connected users\n");
+    printf("  " CLR_BOLD "ADDACCESS" CLR_RESET " -R|-W <file> <user>  Grant read/write access to a user\n");
+    printf("  " CLR_BOLD "REMACCESS" CLR_RESET " <file> <user>     Revoke access from a user\n");
     printf("  " CLR_BOLD "exit" CLR_RESET " / " CLR_BOLD "quit" CLR_RESET "       Disconnect\n");
     printf(CLR_CYAN "  ────────────────────────────────────────────────────\n\n" CLR_RESET);
 }
@@ -772,6 +915,30 @@ static void repl(const char *username) {
         if (strncasecmp(cmd, "DELETE ", 7) == 0) {
             char *fname = trim(cmd + 7);
             cmd_delete(username, fname);
+            continue;
+        }
+
+        /* ADDACCESS -R|-W <filename> <target_user> */
+        if (strncasecmp(cmd, "ADDACCESS ", 10) == 0) {
+            char *rest = trim(cmd + 10);
+            char flag[16] = {0}, fname[MAX_FILENAME] = {0}, target[MAX_USERNAME] = {0};
+            if (sscanf(rest, "%15s %255s %63s", flag, fname, target) == 3) {
+                cmd_addaccess(username, flag, fname, target);
+            } else {
+                print_err("Usage: ADDACCESS -R|-W <filename> <username>");
+            }
+            continue;
+        }
+
+        /* REMACCESS <filename> <target_user> */
+        if (strncasecmp(cmd, "REMACCESS ", 10) == 0) {
+            char *rest = trim(cmd + 10);
+            char fname[MAX_FILENAME] = {0}, target[MAX_USERNAME] = {0};
+            if (sscanf(rest, "%255s %63s", fname, target) == 2) {
+                cmd_remaccess(username, fname, target);
+            } else {
+                print_err("Usage: REMACCESS <filename> <username>");
+            }
             continue;
         }
 

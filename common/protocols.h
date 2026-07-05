@@ -76,7 +76,13 @@ typedef enum {
 
     /* INFO */
     CMD_INFO                 = 27,  /* Client → NM   */
-    CMD_INFO_RESP            = 28   /* NM     → Client */
+    CMD_INFO_RESP            = 28,  /* NM     → Client */
+
+    /* ACCESS CONTROL */
+    CMD_ADDACCESS            = 29,  /* Client → NM   */
+    CMD_ADDACCESS_RESP       = 30,  /* NM     → Client */
+    CMD_REMACCESS            = 31,  /* Client → NM   */
+    CMD_REMACCESS_RESP       = 32   /* NM     → Client */
 } CommandType;
 
 /* ==========================================================================
@@ -316,5 +322,24 @@ typedef struct {
     char    owner[MAX_USERNAME];
     int32_t access_level;
 } InfoResponsePacket;
+
+/* ==========================================================================
+ *  Packet structs — ACCESS CONTROL
+ * ========================================================================== */
+
+/* Client → NM */
+typedef struct {
+    int32_t command_type;                      /* CMD_ADDACCESS or CMD_REMACCESS */
+    char    requester[MAX_USERNAME];
+    char    filename[MAX_FILENAME];
+    char    target_user[MAX_USERNAME];
+    int32_t level;                             /* 1=Read, 2=Read+Write */
+} AccessRequestPacket;
+
+/* NM → Client */
+typedef struct {
+    int32_t status;
+    char    message[MAX_MESSAGE];
+} AccessResponsePacket;
 
 #endif /* PROTOCOLS_H */

@@ -506,6 +506,75 @@ static void handle_info(int fd, int32_t cmd_type, const char *peer_ip) {
     send_struct(fd, &resp, sizeof(resp));
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  ACCESS CONTROL handlers
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void handle_addaccess(int fd, int32_t cmd_type, const char *peer_ip) {
+    AccessRequestPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd, ((char *)&req) + sizeof(int32_t),
+                    sizeof(req) - sizeof(int32_t)) != 0) {
+        nm_log("Failed to read AccessRequestPacket from %s.", peer_ip);
+        return;
+    }
+
+    nm_log("ADDACCESS request: file='%s' user='%s' target='%s' level=%d from %s",
+           req.filename, req.requester, req.target_user, req.level, peer_ip);
+
+    AccessResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+
+    int status = registry_grant_access(req.filename, req.requester, req.target_user, req.level);
+    resp.status = status;
+    if (status == ERR_OK) {
+        snprintf(resp.message, sizeof(resp.message), "Access granted successfully!");
+        nm_log("ADDACCESS OK: granted access to '%s'.", req.target_user);
+    } else if (status == ERR_FILE_NOT_FOUND) {
+        snprintf(resp.message, sizeof(resp.message), "File '%s' not found.", req.filename);
+        nm_log("ADDACCESS FAIL: file '%s' not found.", req.filename);
+    } else if (status == ERR_NO_PERMISSION) {
+        snprintf(resp.message, sizeof(resp.message), "Permission denied. Only the owner can modify access.");
+        nm_log("ADDACCESS FAIL: permission denied for '%s'.", req.requester);
+    } else {
+        snprintf(resp.message, sizeof(resp.message), "Internal error updating access.");
+        nm_log("ADDACCESS FAIL: internal error.");
+    }
+    send_struct(fd, &resp, sizeof(resp));
+}
+
+static void handle_remaccess(int fd, int32_t cmd_type, const char *peer_ip) {
+    AccessRequestPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd, ((char *)&req) + sizeof(int32_t),
+                    sizeof(req) - sizeof(int32_t)) != 0) {
+        nm_log("Failed to read AccessRequestPacket from %s.", peer_ip);
+        return;
+    }
+
+    nm_log("REMACCESS request: file='%s' user='%s' target='%s' from %s",
+           req.filename, req.requester, req.target_user, peer_ip);
+
+    AccessResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+
+    int status = registry_remove_access(req.filename, req.requester, req.target_user);
+    resp.status = status;
+    if (status == ERR_OK) {
+        snprintf(resp.message, sizeof(resp.message), "Access removed successfully!");
+        nm_log("REMACCESS OK: removed access for '%s'.", req.target_user);
+    } else if (status == ERR_FILE_NOT_FOUND) {
+        snprintf(resp.message, sizeof(resp.message), "File '%s' not found.", req.filename);
+        nm_log("REMACCESS FAIL: file '%s' not found.", req.filename);
+    } else if (status == ERR_NO_PERMISSION) {
+        snprintf(resp.message, sizeof(resp.message), "Permission denied. Only the owner can modify access, and owner cannot remove their own access.");
+        nm_log("REMACCESS FAIL: permission denied for '%s'.", req.requester);
+    } else {
+        snprintf(resp.message, sizeof(resp.message), "Internal error updating access.");
+        nm_log("REMACCESS FAIL: internal error.");
+    }
+    send_struct(fd, &resp, sizeof(resp));
+}
+
 /* --- Main connection dispatcher ------------------------------------------- */
 static void *handle_connection(void *arg) {
     Connection *conn = (Connection *)arg;
@@ -547,6 +616,12 @@ static void *handle_connection(void *arg) {
             break;
         case CMD_INFO:
             handle_info(fd, cmd_type, peer_ip);
+            break;
+        case CMD_ADDACCESS:
+            handle_addaccess(fd, cmd_type, peer_ip);
+            break;
+        case CMD_REMACCESS:
+            handle_remaccess(fd, cmd_type, peer_ip);
             break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);
