@@ -29,3 +29,4 @@ client.c
 *.log
 *.pdf
 test_runner.sh
+test_suite.sh
