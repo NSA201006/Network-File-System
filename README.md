@@ -337,21 +337,3 @@ Command IDs defined in `common/protocols.h`.
 └── Makefile
 
 ---
-
-## Change History (Feature Log)
-
-### 2026-07-03
-- **Feature 3 (LIST Connected Users)**: Implemented `LIST` command in client REPL, querying Naming Server for the active registry of client names, IP addresses, and online statuses.
-- **Feature 5 (Universal Error Codes)**: Consolidated and standardized system-wide error definitions in `protocols.h`, mapping internal failure states to universal return codes.
-- **Code Refactor & Bug Fixes**: Removed unused variables (e.g. `storage_dir` context propagation to threads), cleaned block comments, and fixed a bug where `handle_ss_delete` in storage server failed to send an ACK packet back to the naming server.
-
-### 2026-07-05
-- **Access Control (`ADDACCESS`, `REMACCESS`)**: Added the ability for file owners to dynamically grant Read (`-R`), Read/Write (`-W`), or completely revoke access for other users. Integrated Access Control Lists (ACL) into the Naming Server registry.
-- **INFO Command Implementation**: Finished the missing implementation of `INFO` in the client CLI to display rich file metadata, including timestamps, sizes, and the current user's access level.
-
-### 2026-07-07
-- **Distributed Concurrency & Sentence Locking**: Completely overhauled the Storage Server's file handling architecture. Migrated from raw buffer manipulation to a dynamic, in-memory `LiveFile` Linked List containing `SentenceNode` objects.
-- **Lock Management**: Implemented granular `pthread_mutex_t` locks at the sentence level, allowing multiple clients to edit different sentences within the same file simultaneously without the "Index Shifting" problem.
-- **Full WRITE/ETIRW Completion**: Clients now successfully pass `sentence_number` and `word_index` across the network, which the backend safely splices into memory nodes and commits to disk atomically on `ETIRW`, gracefully releasing locks.
-- **UNDO Integration**: Bridged the newly merged remote `UNDO` feature with the local `LiveFile` caching system to ensure file restorations properly clear memory and re-sync across concurrent sessions.
-```
